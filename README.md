@@ -17,7 +17,7 @@ python3 app.py --promote-admin you@example.com
 Open `/admin/api-keys` directly, or use the **Super admin** and **API & keys** header shortcuts after signing in with an authorized account. The Account menu also links to the dashboard. On the deployed server, `bash scripts/enable-superadmin.sh` prompts for the email of an existing account and grants access through the protected local CLI; it never creates a default admin or password. Existing sessions refresh permissions when the browser regains focus. No default credentials, inventory, provider accounts or live payments are created.
 
 ## Administrator GUI
-Tabs: overview, users, listings, reports, keys, payment gateways, tenants and audit. Suspend users, grant/revoke global roles, moderate listings, resolve reports, and inspect recent administrative activity. Self-demotion and self-suspension are blocked. Paid/pending listings cannot be reopened through moderation or seller edits.
+Tabs: overview, users, listings, reports, keys, payment gateways, locations, tenants and audit. Suspend users, grant/revoke global roles, moderate listings, resolve reports, and inspect recent administrative activity. Self-demotion and self-suspension are blocked. Paid/pending listings cannot be reopened through moderation or seller edits.
 
 Keys: provision, rename, edit read/write scopes, bind a marketplace and optional seller, set 1–365 day expiration, set 1–10,000 requests/minute, rotate secrets, revoke keys, inspect authorized-request counts/last use, and enable/disable the external API globally. Secrets display once and only SHA-256 digests persist. Rotation invalidates the previous secret immediately; quota usage stays with the key.
 
@@ -82,6 +82,26 @@ Encrypted GUI settings override matching environment variables. Clearing an envi
 
 Changing the active environment preserves the other environment's webhook verification. Replacing/removing credentials does not revoke the key or change webhook configuration at Stripe/Paystack; update those there and account for pending callbacks. New orders snapshot their payment mode. Legacy Stripe orders can infer mode from a saved `cs_test_`/`cs_live_` reference; legacy orders without an unambiguous mode (including old Paystack orders) require operator reconciliation before accepting a callback.
 
+## Buying and selling radius
+
+**Default: 60 miles (96.56064 km) from the user's current GPS location.** GPS permission is required for this default; the app does not silently substitute a worldwide search when location is unavailable. It refreshes GPS when opening the marketplace, making an explicit search, changing search radius/units, and starting checkout. New listings use the current selling location at creation; existing item locations do not follow a seller as they travel.
+
+Users can choose **Buy / sell area** to save independent buying and selling defaults, set any allowed radius in miles/kilometres, follow current GPS, or choose a fixed address/coordinate center. The quick search radius remains editable; the area dialog has **Use the 60-mile GPS default** to reset. Saved preferences are account- and tenant-specific. Signed-out search settings remain in page memory. Current-mode checkout requires coordinates from the current request rather than silently using a previously saved GPS position.
+
+Each listing has a seller-defined sale radius and a private precise center/address label. Public listing coordinates remain rounded to two decimals; exact private fields are returned only to the owning seller and authorized super-admin location controls. Distances use exact internal centers for comparisons before rounding the displayed distance. Discovery, buyer offers and hosted checkout must satisfy both the selected buying radius and the listing's sale radius. No origin means no geographically eligible discovery results; sellers can still manage their own listings. Legacy listings inherit the tenant's default sale radius, using their existing approximate coordinates until edited.
+
+Super admins can open `/admin/locations` to set tenant default/max buying and selling radii, define an optional marketplace center/boundary, manage member preferences, lock member locations/radii, and edit individual listing centers/radii. Tenant administrators and ordinary users cannot edit these super-admin policies. A tighter maximum is enforced by the backend even when clients alter request parameters. Pending/paid orders lock listing location edits. Private address values are not included in audit events.
+
+The boundaries use straight-line great-circle distance, not road/travel distance. Origins are GPS- or user-supplied: these controls are not proof of physical presence or verified residency. Offline meetings/payments arranged outside the platform cannot be geographically enforced.
+
+### Address lookup
+
+At `/admin/locations`, a super admin can save or remove a Geoapify API key using their current account password. The key uses the existing encrypted credential vault and is never returned to the browser. A legacy `NEARMARKET_GEOAPIFY_KEY` server environment value is also supported. The public Nominatim API is not used.
+
+Address searches occur only after an explicit **Search address** click by a signed-in marketplace member. The UI discloses that the entered address is sent to Geoapify and lets the user choose a result. Fixed provider HTTPS requests have no automatic redirects, include no user account identifiers, and return only normalized coordinates/address labels. Searches are limited to ten uncached requests per minute per account and cached privately per account/tenant for seven days. GPS and manual-coordinate use need no geocoder key. Provider availability, credentials, coverage and account limits determine whether address lookup succeeds; no live geocoder verification was performed during authoring.
+
+References: https://apidocs.geoapify.com/docs/geocoding/forward-geocoding/
+
 ## Olamidepanel deployment
 
 Use [the deployment guide](deploy/OLAMIDEPANEL.md), `ansible/deploy-olamidepanel.yml`, and `scripts/deploy-olamidepanel.sh` to pull from GitHub and deploy alongside the existing panel. Domain, certificate contact and server IPv4 are required inputs. The playbook backs up data, manages only NearMarket’s service/vhost, checks port/DNS conflicts, provisions HTTPS and registers verified status in the panel hosting inventory. It has not yet run on the live server.
@@ -89,7 +109,7 @@ Use [the deployment guide](deploy/OLAMIDEPANEL.md), `ansible/deploy-olamidepanel
 ## Operations and current limits
 `HOST=127.0.0.1`, `PORT=8080`, `NEARMARKET_DATA=./data`. Back up the SQLite database using SQLite backup tooling. Run behind TLS with secure cookies and private application ports. Configure reverse-proxy authentication rate limiting, 3 MB request size limits, process supervision and logs. The standard-library HTTP server is for development and a controlled pilot; a production server architecture is needed before high-volume use.
 
-Browser GPS requires HTTPS or localhost. Manual location accepts neighborhood coordinates; address geocoding is not configured. Coordinates round to two decimals. Photos are at most 2 MB. Browse caps at 1,000 listings per tenant; administration/orders show recent records. Pagination, object storage, email verification/reset, notifications, identity verification, advanced fraud controls and production load validation remain future work. Generated branding images are separate deliverables and are not yet embedded into the website.
+Browser GPS requires HTTPS or localhost. Buying defaults to 60 miles from the current GPS location, refreshed on explicit searches and checkout. Users can change the radius or select a fixed address/coordinate origin. Address search requires a Geoapify API key configured in the super admin location GUI. Coordinates round to two decimals. Photos are at most 2 MB. Browse caps at 1,000 listings per tenant; administration/orders show recent records. Pagination, object storage, email verification/reset, notifications, identity verification, advanced fraud controls and production load validation remain future work. Generated branding images are separate deliverables and are not yet embedded into the website.
 
 ## Verification
 ```sh

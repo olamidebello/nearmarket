@@ -1,4 +1,4 @@
-import tenants, payments, gateway_admin
+import tenants, payments, gateway_admin, trade_locations
 import os, sqlite3, json, secrets, hashlib, hmac, math, time, re, argparse
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -32,7 +32,7 @@ def init():
             if name not in keycols:c.execute(f'ALTER TABLE api_keys ADD COLUMN {name} {definition}')
         c.execute("INSERT OR IGNORE INTO settings VALUES('api_enabled','1')")
         c.execute('DELETE FROM api_usage WHERE minute<?',(int(time.time()//60)-1440,))
-        tenants.init(c);payments.init(c)
+        tenants.init(c);payments.init(c);trade_locations.init(c)
 
 
 def distance(a,b,x,y):
@@ -72,11 +72,11 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith('/api/'):
             self.api('GET'); return
         path=urlparse(self.path).path
-        files={route:'index.html' for route in ('/','/admin','/admin/','/admin/api','/admin/keys','/admin/api-keys','/admin/payment-gateways')}
-        files.update({'/app.js':'app.js','/gateway-gui.js':'gateway-gui.js','/style.css':'style.css'})
+        files={route:'index.html' for route in ('/','/admin','/admin/','/admin/api','/admin/keys','/admin/api-keys','/admin/payment-gateways','/admin/locations')}
+        files.update({'/app.js':'app.js','/gateway-gui.js':'gateway-gui.js','/location-gui.js':'location-gui.js','/style.css':'style.css'})
         if path not in files:self.send(404,{'error':'Not found'});return
         raw=(ROOT/'static'/files[path]).read_bytes(); self.send_response(200)
-        self.send_header('Content-Type',{'index.html':'text/html; charset=utf-8','app.js':'text/javascript','gateway-gui.js':'text/javascript','style.css':'text/css'}[files[path]])
+        self.send_header('Content-Type',{'index.html':'text/html; charset=utf-8','app.js':'text/javascript','gateway-gui.js':'text/javascript','location-gui.js':'text/javascript','style.css':'text/css'}[files[path]])
         self.send_header('Cache-Control','no-store')
         self.send_header('X-Content-Type-Options','nosniff'); self.send_header('Referrer-Policy','same-origin')
         self.send_header('Content-Security-Policy',"default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; base-uri 'none'; frame-ancestors 'none'")
@@ -109,6 +109,7 @@ class Handler(BaseHTTPRequestHandler):
                 public_routes=('/api/tenants','/api/login','/api/signup','/api/me','/api/logout','/api/health','/api/admin','/api/admin/gateways')
                 if not t['public'] and not tenants.member(c,u,t) and route not in public_routes and not route.startswith('/api/v1/'):
                     self.send(403,{'error':'Private marketplace membership required'});return
+                if trade_locations.handle(self,c,u,route,method,d,q,t):return
                 if gateway_admin.handle(self,c,u,route,method,d):return
                 if tenants.handle(self,c,u,route,method,d,t):return
                 if payments.handle(self,c,u,route,method,d,t):return
@@ -184,7 +185,10 @@ class Handler(BaseHTTPRequestHandler):
                     c.execute('DELETE FROM api_usage WHERE key_id=? AND minute<?',(key['id'],minute-1440))
                     if route!='/api/v1/listings':self.send(404,{'error':'Not found'});return
                     if method=='GET':
-                        self.send(200,[dict(r) for r in c.execute("SELECT id,title,description,price,currency,category,condition,area,lat,lon,status FROM listings WHERE status='available' AND tenant_id=? ORDER BY id DESC LIMIT 100",(t['id'],))]);return
+                        location_policy,lat,lon,radius=trade_locations.origin(c,t,None,q)
+                        candidates=c.execute("SELECT id,title,description,price,currency,category,condition,area,lat,lon,status FROM listings WHERE status='available' AND tenant_id=? ORDER BY id DESC LIMIT 100",(t['id'],)).fetchall()
+                        result=[item for row in candidates if (item:=trade_locations.decorate(c,row,location_policy,lat,lon,radius)) is not None]
+                        self.send(200,result);return
                     # Integrations can only post for a real active account selected explicitly.
                     seller=int(d.get('seller',key['seller_id'] or 0))
                     if key['seller_id'] is not None and seller!=key['seller_id']:self.send(403,{'error':'Key is restricted to its linked seller'});return
@@ -193,6 +197,7 @@ class Handler(BaseHTTPRequestHandler):
                     tenants.capacity(c,t)
                     values=clean_listing(d);cur=c.execute('INSERT INTO listings(seller,title,description,price,currency,category,condition,area,lat,lon,image,created) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(seller,*values,time.time()))
                     c.execute('UPDATE listings SET tenant_id=? WHERE id=?',(t['id'],cur.lastrowid))
+                    trade_locations.save_listing(c,t,seller,cur.lastrowid,d)
                     c.execute('INSERT INTO audit(actor,action,target,created) VALUES(NULL,?,?,?)',('api_key:'+str(key['id'])+':create_listing',str(cur.lastrowid),time.time()))
                     self.send(201,{'id':cur.lastrowid});return
                 if route=='/api/health': self.send(200,{'status':'ok','application':'nearmarket','release':os.environ.get('NEARMARKET_RELEASE','development')});return
@@ -213,16 +218,18 @@ class Handler(BaseHTTPRequestHandler):
                     self.send(200,{'id':row['id'],'name':row['name'],'role':row['role']},f'session={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800{secure}');return
                 if route=='/api/listings' and method=='GET':
                     rows=c.execute('SELECT l.*,u.name seller_name FROM listings l JOIN users u ON l.seller=u.id WHERE l.tenant_id=? ORDER BY created DESC LIMIT 1000',(t['id'],)).fetchall();result=[]
-                    lat=coordinate(q['lat'][0],90) if 'lat' in q else None;lon=coordinate(q['lon'][0],180) if lat is not None else None
-                    radius=float(q.get('radius',['25'])[0]);require(math.isfinite(radius) and 0<radius<=10000,'Invalid radius')
+                    location_policy,lat,lon,radius=trade_locations.origin(c,t,u,q)
                     for r in rows:
                         r=dict(r)
                         if q.get('mine') and (not u or r['seller']!=u['id']):continue
                         if not q.get('mine') and r['status']!='available':continue
                         if q.get('q') and q['q'][0].lower() not in (r['title']+' '+r['description']).lower():continue
                         if q.get('category') and r['category']!=q['category'][0]:continue
-                        r['distance']=round(distance(lat,lon,r['lat'],r['lon']),1) if lat is not None else None
-                        if r['distance'] is not None and r['distance']>radius:continue
+                        r=trade_locations.decorate(c,r,location_policy,lat,lon,radius,own=bool(q.get('mine')))
+                        if r is None:continue
+                        if u and r['seller']==u['id']:
+                            private=c.execute('SELECT * FROM listing_locations WHERE listing_id=?',(r['id'],)).fetchone()
+                            r['private_location']=dict(private) if private else {'lat':r['lat'],'lon':r['lon'],'radius_km':r['sell_radius_km'],'label':''}
                         r['saved']=bool(u and c.execute('SELECT 1 FROM favorites WHERE user_id=? AND listing=?',(u['id'],r['id'])).fetchone())
                         if q.get('saved') and not r['saved']:continue
                         result.append(r)
@@ -237,6 +244,7 @@ class Handler(BaseHTTPRequestHandler):
                     tenants.capacity(c,t)
                     values=clean_listing(d);cur=c.execute('INSERT INTO listings(seller,title,description,price,currency,category,condition,area,lat,lon,image,created) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(u['id'],*values,time.time()))
                     c.execute('UPDATE listings SET tenant_id=?,online=? WHERE id=?',(t['id'],int(bool(d.get('online'))),cur.lastrowid))
+                    trade_locations.save_listing(c,t,u['id'],cur.lastrowid,d)
                     self.send(201,{'id':cur.lastrowid});return
                 if route=='/api/messages' and method=='GET':
                     rows=c.execute('SELECT m.*,l.title,u.name sender_name FROM messages m JOIN listings l ON l.id=m.listing JOIN users u ON u.id=m.sender WHERE l.tenant_id=? AND (sender=? OR recipient=?) ORDER BY created DESC LIMIT 500',(t['id'],u['id'],u['id'])).fetchall();self.send(200,[dict(r) for r in rows]);return
@@ -249,6 +257,7 @@ class Handler(BaseHTTPRequestHandler):
                         require(listing['seller']==u['id'],'Only the seller can change this listing')
                         if route=='/api/edit':
                             values=clean_listing(d);c.execute('UPDATE listings SET online=? WHERE id=?',(int(bool(d.get('online'))),lid));c.execute('UPDATE listings SET title=?,description=?,price=?,currency=?,category=?,condition=?,area=?,lat=?,lon=?,image=? WHERE id=?',(*values,lid))
+                            trade_locations.save_listing(c,t,u['id'],lid,d)
                         else:
                             require(d.get('status') in ('available','reserved','sold'),'Invalid status')
                             if d['status'] in ('available','reserved') and listing['status']=='sold':tenants.capacity(c,t)
@@ -265,6 +274,7 @@ class Handler(BaseHTTPRequestHandler):
                         body=str(d.get('body','')).strip();require(1<=len(body)<=2000,'Message must contain 1–2000 characters')
                         offer=None
                         if d.get('offer') not in (None,''):
+                            if u['id']!=listing['seller']:trade_locations.require_purchase(c,t,u,listing,d)
                             amount=float(d['offer']);require(math.isfinite(amount) and 0<amount<=10000000,'Invalid offer');offer=round(amount*100)
                         c.execute('INSERT INTO messages(listing,sender,recipient,body,offer,created) VALUES(?,?,?,?,?,?)',(lid,u['id'],recipient,body,offer,time.time()))
                     self.send(200,{'ok':True});return

@@ -127,3 +127,9 @@ Pull and rerun the production playbook. It installs `python3-cryptography`, crea
 Open `https://nearmarket.africandroid.world/admin/payment-gateways` as a super admin. Choose a tenant, provider and environment, enter replacement secrets, and save using your current NearMarket password. You may import existing environment values instead of typing them. Connection checks are read-only. GUI changes do not require a service restart; switching the root live-payment policy still requires an operator environment change and restart.
 
 Store a protected off-server backup of the gateway master key alongside your recovery procedures, separate from the database. Never print it into chat, commit it, or delete it during upgrades. Database-only recovery cannot decrypt gateway credentials without that key. Legacy environment credentials stay on disk until an operator removes them; GUI replacement does not revoke provider-side keys.
+
+## Upgrade for location/radius controls
+
+Pull and rerun the production playbook. Location tables migrate additively. The default buying/selling radius is **60 miles** from current GPS, and users can override it within the tenant maximum or choose a fixed origin. Existing listings retain approximate coordinates until edited and inherit tenant radius defaults if no individual rule exists.
+
+Open **Buy / sell area** for user preferences or `/admin/locations` as super admin for tenant defaults, maximums, member locks and item radii. The optional Geoapify address API key can be configured there in the existing encrypted vault; GPS/manual coordinates work without it. The saved root encryption key must be retained as described above. Live GPS/browser permissions and a real geocoder provider call have not been verified in authoring.

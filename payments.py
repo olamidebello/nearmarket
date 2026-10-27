@@ -1,5 +1,5 @@
 """Hosted gateway adapters. Payment status only changes on signed provider events."""
-import gateway_admin
+import gateway_admin, trade_locations
 import os,json,time,secrets,hmac,hashlib,urllib.request,urllib.parse
 
 def init(c):
@@ -98,6 +98,7 @@ def handle(h,c,u,route,method,d,t):
     l=c.execute('SELECT * FROM listings WHERE id=? AND tenant_id=?',(int(d.get('listing',0)),t['id'])).fetchone()
     if not l or l['status']!='available' or not l['online']:raise ValueError('Item is not available for online checkout')
     if l['seller']==u['id']:raise ValueError('You cannot buy your own item')
+    trade_locations.require_purchase(c,t,u,l,d)
     if l['price']<=0:raise ValueError('Arrange free-item pickup directly with the seller')
     if g=='paystack' and l['currency']!='NGN':raise ValueError('Paystack currently supports NGN listings only')
     oid='nmorder_'+secrets.token_hex(16)

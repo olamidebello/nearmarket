@@ -95,6 +95,74 @@ class Market(unittest.TestCase):
     # Reauthentication is throttled independently from normal sign-in.
     for i in range(5):self.assertEqual(self.req('admin/gateways',{**payload,'current_password':'wrong'},admin)[0],403)
     self.assertEqual(self.req('admin/gateways',payload,admin)[0],429)
+ def test_location_radius_defaults_overrides_and_privacy(self):
+  import math,trade_locations
+  from unittest.mock import patch
+  _,boss,a=self.req('signup',{'name':'Radius Admin','email':'radiusadmin@example.com','password':'longpassword123'})
+  _,seller,s=self.req('signup',{'name':'Radius Seller','email':'radiusseller@example.com','password':'longpassword123'})
+  _,buyer,b=self.req('signup',{'name':'Radius Buyer','email':'radiusbuyer@example.com','password':'longpassword123'})
+  with app.db() as c:c.execute("UPDATE users SET role='superadmin' WHERE id=?",(boss['id'],))
+  self.req('tenant/admin',{'action':'create','name':'Radius Market','slug':'radius-market','owner':'radiusseller@example.com','public':True},a)
+  with app.db() as c:tid=c.execute("SELECT id FROM tenants WHERE slug='radius-market'").fetchone()[0]
+  self.req('tenant/join',{},b,tenant=tid)
+  lon=lambda miles:math.degrees(miles*trade_locations.MI_TO_KM/6371)
+  state=self.req('location-settings',cookie=b,tenant=tid)[1]
+  self.assertAlmostEqual(state['policy']['default_buy_km'],60*1.609344)
+  self.assertEqual(self.req('admin/locations',cookie=s,tenant=tid)[0],403)
+  item={'title':'Radius test chair','description':'Chair available within the local sales area','price':50,'currency':'USD','category':'Furniture','condition':'Good','area':'Neighborhood','lat':0,'lon':0,'private_address':'Private pickup address, not public','online':True}
+  code,l,_=self.req('listings',item,s,tenant=tid);self.assertEqual(code,201)
+  lid=l['id']
+  self.assertEqual(self.req('listings',cookie=b,tenant=tid)[1],[])
+  within=self.req('listings?lat=0&lon='+str(lon(59.9)),cookie=b,tenant=tid)[1]
+  self.assertEqual(len(within),1);self.assertAlmostEqual(within[0]['sell_radius_km'],96.56064)
+  self.assertNotIn('private_location',within[0]);self.assertNotIn('Private pickup address',json.dumps(within))
+  self.assertEqual(self.req('listings?lat=0&lon='+str(lon(60.1)),cookie=b,tenant=tid)[1],[])
+  mine=self.req('listings?mine=1',cookie=s,tenant=tid)[1]
+  self.assertEqual(mine[0]['private_location']['label'],item['private_address'])
+  other={**item,'title':'Precise private location','lat':10.123456,'lon':20.654321}
+  self.assertEqual(self.req('listings',other,s,tenant=tid)[0],201)
+  public=self.req('listings?lat=10.123456&lon=20.654321',cookie=b,tenant=tid)[1][0]
+  self.assertEqual(public['lat'],10.12);self.assertEqual(public['lon'],20.65);self.assertNotIn('private_location',public)
+  self.assertEqual(self.req('location-settings',{'kind':'buy','label':'My private address','lat':0,'lon':lon(30),'radius':20,'unit':'mi','use_current':False},b,tenant=tid)[0],200)
+  self.assertEqual(self.req('listings',cookie=b,tenant=tid)[1],[])
+  self.assertEqual(len(self.req('listings?radius=40&unit=mi',cookie=b,tenant=tid)[1]),1)
+  edit={**item,'listing':lid,'sell_radius':10,'sell_radius_unit':'mi'}
+  self.assertEqual(self.req('edit',edit,s,tenant=tid)[0],200)
+  self.assertEqual(self.req('listings?lat=0&lon='+str(lon(10.1))+'&radius=60&unit=mi',cookie=b,tenant=tid)[1],[])
+  self.assertEqual(self.req('messages',{'listing':lid,'body':'Can I buy this?','offer':40,'lat':0,'lon':lon(11)},b,tenant=tid)[0],400)
+  self.assertEqual(self.req('messages',{'listing':lid,'body':'Can I buy this?','offer':40,'lat':0,'lon':lon(9)},b,tenant=tid)[0],200)
+  # Super admins can lock a user center/radius, and ordinary users cannot override it.
+  self.assertEqual(self.req('admin/locations',{'action':'user','user_id':buyer['id'],'kind':'buy','label':'Assigned area','lat':0,'lon':0,'radius':5,'unit':'mi','locked':True,'use_current':False},a,tenant=tid)[0],200)
+  self.assertEqual(self.req('location-settings',{'kind':'buy','label':'Override','lat':0,'lon':0,'radius':100,'unit':'mi'},b,tenant=tid)[0],400)
+  with app.db() as c:
+   t=c.execute('SELECT * FROM tenants WHERE id=?',(tid,)).fetchone();row=c.execute('SELECT * FROM listings WHERE id=?',(lid,)).fetchone()
+   # Checkout uses unrounded distances and the locked account policy, even if coordinates are forged.
+   trade_locations.require_purchase(c,t,buyer,row,{'lat':0,'lon':lon(999),'radius':100})
+   self.assertAlmostEqual(trade_locations.radius(60,'mi'),96.56064)
+   with self.assertRaises(ValueError):trade_locations.radius(float('nan'))
+  # Marketplace boundaries are enforced on listing writes, not just by the frontend.
+  policy={'action':'policy','default_buy_km':96.56064,'default_sell_km':96.56064,'max_buy_km':500,'max_sell_km':500,'center_lat':0,'center_lon':0,'market_radius_km':20,'restrict_marketplace':True,'area_label':'Local zone'}
+  self.assertEqual(self.req('admin/locations',policy,a,tenant=tid)[0],200)
+  self.assertEqual(self.req('listings',{**item,'lon':lon(20)},s,tenant=tid)[0],400)
+  self.assertEqual(self.req('geocode',{'address':'An address'},b,tenant=tid)[0],400)
+  with patch.dict(os.environ,{'NEARMARKET_GEOAPIFY_KEY':'fixtureGeoapifyKey123'}),patch.object(trade_locations,'lookup',return_value=[{'lat':0,'lon':0,'label':'Example address','area':'Town'}]) as geocoder:
+   self.assertEqual(self.req('geocode',{'address':'Example address'},b,tenant=tid)[0],200)
+   self.assertEqual(self.req('geocode',{'address':'Example address'},b,tenant=tid)[0],200)
+   self.assertEqual(geocoder.call_count,1)
+ def test_radius_math_and_current_gps_checkout(self):
+  import trade_locations
+  self.assertAlmostEqual(trade_locations.distance(0,179.9,0,-179.9),22.2389853289,places=5)
+  self.assertAlmostEqual(trade_locations.radius(60,'mi'),96.56064)
+  for value in ('nan','inf',-1,0):
+   with self.assertRaises(ValueError):trade_locations.radius(value)
+  _,u,cookie=self.req('signup',{'name':'GPS Buyer','email':'gpsbuyer@example.com','password':'longpassword123'})
+  self.req('location-settings',{'kind':'buy','label':'GPS origin','lat':0,'lon':0,'radius':60,'unit':'mi','use_current':True},cookie)
+  with app.db() as c:
+   t=c.execute('SELECT * FROM tenants WHERE id=1').fetchone()
+   listing={'id':9999999,'lat':0,'lon':0}
+   with self.assertRaises(ValueError):trade_locations.require_purchase(c,t,u,listing,{})
+   trade_locations.require_purchase(c,t,u,listing,{'lat':0,'lon':0})
+   with self.assertRaises(ValueError):trade_locations.require_purchase(c,t,u,listing,{'lat':0,'lon':2})
  def test_permissions_and_marketplace(self):
   _,u,s=self.req('signup',{'name':'Seller','email':'s@example.com','password':'longpassword123'})
   _,v,b=self.req('signup',{'name':'Buyer','email':'b@example.com','password':'longpassword123'})
@@ -103,7 +171,7 @@ class Market(unittest.TestCase):
   self.assertEqual(len(self.req('listings?lat=32.78&lon=-96.8&radius=5')[1]),1)
   self.assertEqual(self.req('listings?lat=0&lon=0&radius=5')[1],[])
   self.assertEqual(self.req('status',{'listing':l['id'],'status':'sold'},b)[0],400)
-  self.assertEqual(self.req('messages',{'listing':l['id'],'body':'Still available?','offer':45},b)[0],200)
+  self.assertEqual(self.req('messages',{'listing':l['id'],'body':'Still available?','offer':45,'lat':32.78,'lon':-96.8},b)[0],200)
   self.assertEqual(len(self.req('messages',cookie=s)[1]),1)
   self.assertEqual(self.req('admin',cookie=b)[0],403)
   with app.db() as c:c.execute("UPDATE users SET role='superadmin' WHERE id=?",(u['id'],))
@@ -129,7 +197,7 @@ class Market(unittest.TestCase):
   self.assertEqual(self.req('tenant/admin',{'action':'member','email':'tenantbuyer@example.com','role':'member'},admin,tenant=tid)[0],200)
   d={'title':'Tenant chair','description':'A chair in private market','price':50,'currency':'USD','category':'Furniture','condition':'Good','area':'Dallas','lat':32.78,'lon':-96.8,'online':True}
   code,l,_=self.req('listings',d,admin,tenant=tid);self.assertEqual(code,201)
-  self.assertEqual(len(self.req('listings',cookie=b,tenant=tid)[1]),1)
+  self.assertEqual(len(self.req('listings?lat=32.78&lon=-96.8',cookie=b,tenant=tid)[1]),1)
   self.assertNotIn(l['id'],[r['id'] for r in self.req('listings')[1]])
   self.assertEqual(self.req('messages',{'listing':l['id'],'body':'Hello'},b)[0],400)
   self.assertEqual(self.req('tenant/admin',cookie=b,tenant=tid)[0],403)
@@ -147,8 +215,8 @@ class Market(unittest.TestCase):
   self.req('tenant/admin',{'action':'settings','name':'Private Market','public':False,'listing_limit':10,'payments':True,'stripe':True,'paystack':False},admin,tenant=tid)
   env={f'NEARMARKET_T{tid}_STRIPE_SECRET':'sk_test_fixture',f'NEARMARKET_T{tid}_STRIPE_WEBHOOK_SECRET':'whsec_fixture','NEARMARKET_PUBLIC_URL':'https://market.example'}
   with patch.dict(os.environ,env),patch('payments.checkout',return_value=('cs_test_fixture','https://checkout.stripe.com/c/test_fixture')):
-   code,o,_=self.req('checkout',{'listing':l['id'],'gateway':'stripe'},b,tenant=tid);self.assertEqual(code,201)
-   self.assertEqual(self.req('checkout',{'listing':l['id'],'gateway':'stripe'},b,tenant=tid)[0],400)
+   code,o,_=self.req('checkout',{'listing':l['id'],'gateway':'stripe','lat':32.78,'lon':-96.8},b,tenant=tid);self.assertEqual(code,201)
+   self.assertEqual(self.req('checkout',{'listing':l['id'],'gateway':'stripe','lat':32.78,'lon':-96.8},b,tenant=tid)[0],400)
    self.assertEqual(self.req('status',{'listing':l['id'],'status':'available'},admin,tenant=tid)[0],400)
    def hook(event,valid=True):
     raw=json.dumps(event).encode();stamp=str(int(time.time()));sig=hmac.new(b'whsec_fixture',stamp.encode()+b'.'+raw,hashlib.sha256).hexdigest()

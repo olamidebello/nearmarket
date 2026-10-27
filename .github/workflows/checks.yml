@@ -17,3 +17,4 @@ jobs:
       - run: python3 -m unittest discover -s tests -v
       - run: node --check static/app.js
       - run: node --check static/gateway-gui.js
+      - run: node --check static/location-gui.js
