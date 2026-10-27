@@ -119,3 +119,11 @@ If it still fails, the report now distinguishes `acme_http_routing`, `certificat
 Rotate any credentials that were pasted into chat or otherwise exposed. From an interactive root terminal on the deployed server, run `python3 scripts/configure-stripe.py --tenant 1` and enter a test key and the endpoint signing secret at the hidden prompts. For replacement live keys, explicitly pass `--enable-live`. This sets the existing global live-payment gate, affecting all configured live gateways; it does not enable an individual tenant.
 
 The helper preserves other environment settings, writes the selected tenant's credentials only to the root-only server file, and restarts NearMarket. It does not send credentials over chat, accept them as arguments, create Stripe accounts/webhook endpoints, or claim provider verification. Enable payments/Stripe separately in the tenant admin GUI. Webhook path for tenant 1: `/api/webhooks/stripe/1`. Keep the endpoint's signing secret matched to its Stripe environment and configured events.
+
+## Upgrade for GUI-managed payment gateways
+
+Pull and rerun the production playbook. It installs `python3-cryptography`, creates `/etc/nearmarket/gateway.key` only if no encrypted gateway data exists yet, and updates the systemd unit with `LoadCredential=nearmarket_gateway_key:/etc/nearmarket/gateway.key`. The application may read the service credential but cannot replace the root master key. Existing `/etc/nearmarket/secrets.env` values are preserved.
+
+Open `https://nearmarket.africandroid.world/admin/payment-gateways` as a super admin. Choose a tenant, provider and environment, enter replacement secrets, and save using your current NearMarket password. You may import existing environment values instead of typing them. Connection checks are read-only. GUI changes do not require a service restart; switching the root live-payment policy still requires an operator environment change and restart.
+
+Store a protected off-server backup of the gateway master key alongside your recovery procedures, separate from the database. Never print it into chat, commit it, or delete it during upgrades. Database-only recovery cannot decrypt gateway credentials without that key. Legacy environment credentials stay on disk until an operator removes them; GUI replacement does not revoke provider-side keys.

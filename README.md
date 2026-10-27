@@ -4,7 +4,7 @@
 Local flea marketplace with accounts, photo listings, radius search, favorites, offers, private messages, seller controls, reports, multiple marketplaces, tenant administration, hosted checkout, order issues and pickup confirmation.
 
 ## Run
-Python 3.11+, no third-party dependencies.
+Python 3.11+ with the `cryptography` package for encrypted gateway credentials. Install with `python3 -m pip install -r requirements.txt` in a virtual environment. The Debian deployment playbook installs `python3-cryptography` automatically.
 
 ```sh
 python3 app.py
@@ -17,7 +17,7 @@ python3 app.py --promote-admin you@example.com
 Open `/admin/api-keys` directly, or use the **Super admin** and **API & keys** header shortcuts after signing in with an authorized account. The Account menu also links to the dashboard. On the deployed server, `bash scripts/enable-superadmin.sh` prompts for the email of an existing account and grants access through the protected local CLI; it never creates a default admin or password. Existing sessions refresh permissions when the browser regains focus. No default credentials, inventory, provider accounts or live payments are created.
 
 ## Administrator GUI
-Tabs: overview, users, listings, reports, keys, tenants and audit. Suspend users, grant/revoke global roles, moderate listings, resolve reports, and inspect recent administrative activity. Self-demotion and self-suspension are blocked. Paid/pending listings cannot be reopened through moderation or seller edits.
+Tabs: overview, users, listings, reports, keys, payment gateways, tenants and audit. Suspend users, grant/revoke global roles, moderate listings, resolve reports, and inspect recent administrative activity. Self-demotion and self-suspension are blocked. Paid/pending listings cannot be reopened through moderation or seller edits.
 
 Keys: provision, rename, edit read/write scopes, bind a marketplace and optional seller, set 1–365 day expiration, set 1–10,000 requests/minute, rotate secrets, revoke keys, inspect authorized-request counts/last use, and enable/disable the external API globally. Secrets display once and only SHA-256 digests persist. Rotation invalidates the previous secret immediately; quota usage stays with the key.
 
@@ -37,7 +37,7 @@ Send `Authorization: Bearer YOUR_KEY` and `X-Tenant-ID: TENANT_ID` over HTTPS.
 Write keys may act for any active tenant seller unless bound to one seller. Keep keys on trusted servers. Expiration, revocation, scopes, tenant, seller restrictions and minute quotas are enforced. The integration API switch leaves browser marketplace/admin endpoints available. Request counters measure requests authorized by key/scope, not total failed authentication attempts.
 
 ## Stripe and Paystack hosted checkout
-Gateways are implemented but **not configured or live-tested**. Use provider sandbox credentials first. Each tenant uses its own merchant account credentials. Set these in the server environment, never source control or browser code:
+Gateways are implemented but **not configured or live-tested**. Use provider sandbox credentials first. Each tenant uses its own merchant account credentials. Super admins can configure them at `/admin/payment-gateways` after deploying the vault-enabled release. Legacy server environment values remain supported until that tenant/provider/mode is saved or cleared in the GUI. Environment variables are an optional bootstrap method; never put secrets in source control or browser code:
 
 ```text
 NEARMARKET_PUBLIC_URL=https://your-market-domain.example
@@ -67,6 +67,20 @@ Primary implementation references:
 - https://docs.stripe.com/webhooks/signature
 - https://paystack.com/docs/payments/accept-payments/
 - https://paystack.com/docs/payments/webhooks/
+
+## Payment gateway GUI
+
+Open **Super admin → Gateways** or `/admin/payment-gateways`. Select a tenant and Stripe/Paystack, then select test or live settings. Add/edit internal labels, optional publishable keys, replacement secret keys and Stripe webhook signing secrets. Blank secret inputs preserve saved values; existing secrets are masked and never sent back to the browser. Save chooses the active environment and updates that tenant's payment/gateway switches. Separate **Import server credentials**, **Check saved API connection**, and **Remove credentials for this mode** operations are available.
+
+Changes require your current NearMarket password. Failed password checks are rate-limited; ordinary users and tenant administrators cannot access this API even with edited request headers. Changes and connection checks are audited without credential values. GUI saves take effect without restarting NearMarket. Connection checks call a fixed, read-only balance endpoint; they never create a charge and do not establish webhook delivery or full checkout capability. Restricted Stripe keys may lack balance-read permission even if other operations are allowed.
+
+Secrets are Fernet-encrypted in the SQLite database with authenticated tenant/provider/mode/field context. The deployment playbook provisions a root-only `/etc/nearmarket/gateway.key` once and delivers a read-only copy to the application through systemd credentials. Back up that master key securely, separately from database backups. If it is lost, encrypted credentials cannot be recovered; deployment refuses to generate a replacement when encrypted rows already exist. Local development can set `NEARMARKET_GATEWAY_KEY_FILE` to a protected Fernet key file. Missing/invalid vault keys fail closed for saved credentials.
+
+Live mode requires both the per-gateway tenant switch and the root-controlled `NEARMARKET_ALLOW_LIVE_PAYMENTS=1`. The web GUI cannot enable that server-wide policy. Tenant isolation and fixed provider endpoints apply to all saved configurations; arbitrary gateway URLs and arbitrary new provider adapters cannot be added through the form.
+
+Encrypted GUI settings override matching environment variables. Clearing an environment stores an explicit empty configuration so old environment credentials do not silently reactivate; it disables that active gateway. Import is an explicit way to replace saved settings with server environment credentials. The terminal Stripe setup helper changes environment values only: after adopting GUI storage, use the GUI's import operation if you intend to apply a later environment-file change.
+
+Changing the active environment preserves the other environment's webhook verification. Replacing/removing credentials does not revoke the key or change webhook configuration at Stripe/Paystack; update those there and account for pending callbacks. New orders snapshot their payment mode. Legacy Stripe orders can infer mode from a saved `cs_test_`/`cs_live_` reference; legacy orders without an unambiguous mode (including old Paystack orders) require operator reconciliation before accepting a callback.
 
 ## Olamidepanel deployment
 

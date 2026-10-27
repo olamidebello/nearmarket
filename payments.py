@@ -1,4 +1,5 @@
 """Hosted gateway adapters. Payment status only changes on signed provider events."""
+import gateway_admin
 import os,json,time,secrets,hmac,hashlib,urllib.request,urllib.parse
 
 def init(c):
@@ -7,21 +8,17 @@ def init(c):
     CREATE UNIQUE INDEX IF NOT EXISTS order_item_active ON orders(listing) WHERE status IN ('pending','paid');
     CREATE TABLE IF NOT EXISTS payment_events(tenant_id INTEGER,gateway TEXT,event_id TEXT,created REAL,PRIMARY KEY(tenant_id,gateway,event_id));
     ''')
+    gateway_admin.init(c)
     cols={r[1] for r in c.execute('PRAGMA table_info(orders)')}
-    for name,definition in {'pickup_code':'TEXT','collected':'REAL'}.items():
+    for name,definition in {'pickup_code':'TEXT','collected':'REAL','mode':'TEXT'}.items():
         if name not in cols:c.execute(f'ALTER TABLE orders ADD COLUMN {name} {definition}')
     c.execute("CREATE TABLE IF NOT EXISTS disputes(id INTEGER PRIMARY KEY,order_id TEXT UNIQUE REFERENCES orders(id),buyer INTEGER,reason TEXT,status TEXT DEFAULT 'open',resolution TEXT,created REAL)")
 
-def credential(t,g,suffix='SECRET'):
-    return os.environ.get(f"NEARMARKET_T{t['id']}_{g.upper()}_{suffix}",'')
+def credential(t,g,suffix='SECRET',mode=None):
+    return gateway_admin.read_secret(t['id'],g,suffix,mode)
 
 def gateway_status(t):
-    result={}
-    for g in ('stripe','paystack'):
-        secret=credential(t,g);configured=bool(secret and (g=='paystack' or credential(t,g,'WEBHOOK_SECRET')))
-        live=secret.startswith('sk_live_');allowed=not live or os.environ.get('NEARMARKET_ALLOW_LIVE_PAYMENTS')=='1'
-        result[g]={'enabled':bool(t['payments'] and t[g]),'configured':configured,'mode':'live' if live else 'test','ready':bool(t['payments'] and t[g] and configured and allowed),'secret_env':f"NEARMARKET_T{t['id']}_{g.upper()}_SECRET",'webhook_path':f"/api/webhooks/{g}/{t['id']}"}
-    return result
+    return gateway_admin.status(t)
 
 def provider_post(url,payload,secret,form=False,idempotency=None):
     body=urllib.parse.urlencode(payload).encode() if form else json.dumps(payload).encode()
@@ -35,12 +32,13 @@ def checkout(t,g,o,email,title):
     p=urllib.parse.urlparse(base)
     if p.scheme!='https' or not p.netloc or p.query or p.fragment:raise ValueError('Configure NEARMARKET_PUBLIC_URL as the public HTTPS origin')
     if not gateway_status(t)[g]['ready']:raise ValueError('Gateway is not configured or enabled')
+    mode=o['mode'] if 'mode' in o.keys() and o['mode'] else gateway_status(t)[g]['mode']
     if g=='stripe':
-        r=provider_post('https://api.stripe.com/v1/checkout/sessions',{'mode':'payment','customer_email':email,'client_reference_id':o['id'],'metadata[order_id]':o['id'],'line_items[0][price_data][currency]':o['currency'].lower(),'line_items[0][price_data][unit_amount]':o['amount'],'line_items[0][price_data][product_data][name]':title,'line_items[0][quantity]':1,'success_url':base+'/?order='+o['id'],'cancel_url':base+'/?order='+o['id'],'expires_at':int(time.time())+1800},credential(t,g),True,o['id'])
+        r=provider_post('https://api.stripe.com/v1/checkout/sessions',{'mode':'payment','customer_email':email,'client_reference_id':o['id'],'metadata[order_id]':o['id'],'line_items[0][price_data][currency]':o['currency'].lower(),'line_items[0][price_data][unit_amount]':o['amount'],'line_items[0][price_data][product_data][name]':title,'line_items[0][quantity]':1,'success_url':base+'/?order='+o['id'],'cancel_url':base+'/?order='+o['id'],'expires_at':int(time.time())+1800},credential(t,g,mode=mode),True,o['id'])
         ref,url=r['id'],r['url']
     else:
         if o['currency']!='NGN':raise ValueError('Paystack checkout currently supports NGN listings only')
-        r=provider_post('https://api.paystack.co/transaction/initialize',{'email':email,'amount':o['amount'],'currency':o['currency'],'reference':o['id'],'callback_url':base+'/?order='+o['id'],'metadata':{'order_id':o['id']}},credential(t,g))
+        r=provider_post('https://api.paystack.co/transaction/initialize',{'email':email,'amount':o['amount'],'currency':o['currency'],'reference':o['id'],'callback_url':base+'/?order='+o['id'],'metadata':{'order_id':o['id']}},credential(t,g,mode=mode))
         if not r.get('status'):raise ValueError('Gateway declined checkout initialization')
         ref,url=r['data']['reference'],r['data']['authorization_url']
     host=urllib.parse.urlparse(url)
@@ -103,7 +101,7 @@ def handle(h,c,u,route,method,d,t):
     if l['price']<=0:raise ValueError('Arrange free-item pickup directly with the seller')
     if g=='paystack' and l['currency']!='NGN':raise ValueError('Paystack currently supports NGN listings only')
     oid='nmorder_'+secrets.token_hex(16)
-    c.execute('INSERT INTO orders(id,tenant_id,listing,buyer,seller,amount,currency,gateway,created) VALUES(?,?,?,?,?,?,?,?,?)',(oid,t['id'],l['id'],u['id'],l['seller'],l['price'],l['currency'],g,time.time()))
+    c.execute('INSERT INTO orders(id,tenant_id,listing,buyer,seller,amount,currency,gateway,created,mode) VALUES(?,?,?,?,?,?,?,?,?,?)',(oid,t['id'],l['id'],u['id'],l['seller'],l['price'],l['currency'],g,time.time(),gateway_status(t)[g]['mode']))
     c.execute("UPDATE listings SET status='reserved' WHERE id=?",(l['id'],));c.commit()
     # Persist reservation before network I/O; uncertain failures remain pending for reconciliation.
     o=c.execute('SELECT * FROM orders WHERE id=?',(oid,)).fetchone()
@@ -114,11 +112,15 @@ def handle(h,c,u,route,method,d,t):
     c.execute('UPDATE orders SET provider_ref=?,checkout_url=? WHERE id=?',(ref,url,oid))
     h.send(201,{'id':oid,'url':url});return True
 
-def signature(g,raw,headers,t):
+def signature(g,raw,headers,t,mode=None):
+    if mode is None:
+        return any(signature(g,raw,headers,t,m) for m in ('test','live'))
     if g=='paystack':
-        secret=credential(t,g)
+        try:secret=credential(t,g,mode=mode)
+        except ValueError:return False
         return bool(secret and hmac.compare_digest(hmac.new(secret.encode(),raw,hashlib.sha512).hexdigest(),headers.get('x-paystack-signature','')))
-    secret=credential(t,g,'WEBHOOK_SECRET')
+    try:secret=credential(t,g,'WEBHOOK_SECRET',mode)
+    except ValueError:return False
     if not secret:return False
     values={}
     for part in headers.get('Stripe-Signature','').split(','):
@@ -133,7 +135,8 @@ def signature(g,raw,headers,t):
 
 def webhook(h,c,g,tid,raw):
     t=c.execute('SELECT * FROM tenants WHERE id=?',(tid,)).fetchone()
-    if not t or not signature(g,raw,h.headers,t):h.send(400,{'error':'Invalid signature'});return
+    verified_mode=next((m for m in ('test','live') if t and signature(g,raw,h.headers,t,m)),None)
+    if not verified_mode:h.send(400,{'error':'Invalid signature'});return
     event=json.loads(raw);obj=event.get('data',{}).get('object',{}) if g=='stripe' else event.get('data',{})
     kind=event.get('type') if g=='stripe' else event.get('event')
     if g=='stripe':
@@ -149,6 +152,14 @@ def webhook(h,c,g,tid,raw):
     c.execute('BEGIN IMMEDIATE')
     o=c.execute('SELECT * FROM orders WHERE id=? AND tenant_id=? AND gateway=?',(oid,tid,g)).fetchone()
     if not o:h.send(400,{'error':'Unknown order'});return
+    order_mode=o['mode']
+    if order_mode is None and g=='stripe':
+        original_ref=o['provider_ref'] or ''
+        order_mode='live' if original_ref.startswith('cs_live_') else 'test' if original_ref.startswith('cs_test_') else None
+    if order_mode is None:h.send(400,{'error':'Legacy order requires payment-environment reconciliation'});return
+    if order_mode!=verified_mode:h.send(400,{'error':'Payment environment mismatch'});return
+    if g=='stripe' and 'livemode' in event and bool(event['livemode'])!=(verified_mode=='live'):h.send(400,{'error':'Payment environment mismatch'});return
+    if g=='paystack' and obj.get('domain') in ('test','live') and obj['domain']!=verified_mode:h.send(400,{'error':'Payment environment mismatch'});return
     if not eid or (o['provider_ref'] and o['provider_ref']!=ref):h.send(400,{'error':'Reference mismatch'});return
     if paid and (amount!=o['amount'] or currency!=o['currency']):h.send(400,{'error':'Amount or currency mismatch'});return
     if c.execute('SELECT 1 FROM payment_events WHERE tenant_id=? AND gateway=? AND event_id=?',(tid,g,eid)).fetchone():h.send(200,{'ok':True});return

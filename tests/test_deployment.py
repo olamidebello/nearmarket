@@ -55,6 +55,7 @@ class DeploymentTests(unittest.TestCase):
         unit = d.unit_text()
         self.assertIn('User=nearmarket', unit)
         self.assertIn('ProtectSystem=strict', unit)
+        self.assertIn('LoadCredential=nearmarket_gateway_key:/etc/nearmarket/gateway.key', unit)
         self.assertIn('ReadWritePaths=/var/lib/nearmarket', unit)
         self.assertIn('HOST=127.0.0.1', d.environment(self.cfg))
         bootstrap = d.nginx_text(self.cfg, False)

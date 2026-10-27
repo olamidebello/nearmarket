@@ -40,7 +40,7 @@
   tasks:
     - name: Install application and certificate prerequisites only
       ansible.builtin.apt:
-        name: [git, python3, ca-certificates, curl, certbot, dnsutils, iproute2]
+        name: [git, python3, ca-certificates, curl, certbot, dnsutils, iproute2, python3-cryptography]
         state: present
         update_cache: true
         cache_valid_time: 3600
@@ -90,6 +90,27 @@
         owner: root
         group: root
         mode: '0755'
+    - name: Provision the gateway vault key once without exposing it
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -c
+          - |
+            import os, sqlite3
+            from pathlib import Path
+            from cryptography.fernet import Fernet
+            key = Path('/etc/nearmarket/gateway.key')
+            db = Path('/var/lib/nearmarket/market.db')
+            if db.exists():
+                with sqlite3.connect('file:' + str(db) + '?mode=ro', uri=True) as c:
+                    table = c.execute("SELECT 1 FROM sqlite_master WHERE name='gateway_configs'").fetchone()
+                    if table and c.execute("SELECT 1 FROM gateway_configs WHERE secret_cipher!='' OR webhook_cipher!='' LIMIT 1").fetchone():
+                        raise SystemExit('Restore the original vault key before deploying encrypted gateway data')
+            fd = os.open(key, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, 'wb') as f:
+                f.write(Fernet.generate_key())
+        creates: /etc/nearmarket/gateway.key
+      no_log: true
     - name: Create a protected gateway environment file without replacing existing secrets
       ansible.builtin.copy:
         dest: /etc/nearmarket/secrets.env

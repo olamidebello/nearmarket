@@ -203,6 +203,7 @@ Group=nearmarket
 WorkingDirectory=/opt/nearmarket/current
 EnvironmentFile=/etc/nearmarket/runtime.env
 EnvironmentFile=-/etc/nearmarket/secrets.env
+LoadCredential=nearmarket_gateway_key:/etc/nearmarket/gateway.key
 ExecStart=/usr/bin/python3 -B -u /opt/nearmarket/current/app.py
 Restart=on-failure
 RestartSec=5

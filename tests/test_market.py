@@ -15,7 +15,7 @@ class Market(unittest.TestCase):
   except urllib.error.HTTPError as e:return e.code,json.load(e),''
  def test_admin_gui_routes_and_role_activation(self):
   import subprocess
-  for path in ('/admin','/admin/api-keys','/admin/api','/admin/keys'):
+  for path in ('/admin','/admin/api-keys','/admin/api','/admin/keys','/admin/payment-gateways'):
    with urllib.request.urlopen('http://127.0.0.1:'+str(self.s.server_port)+path) as response:
     self.assertEqual(response.status,200)
     self.assertIn('text/html',response.headers['Content-Type'])
@@ -31,6 +31,70 @@ class Market(unittest.TestCase):
   subprocess.run([sys.executable,app.__file__,'--promote-admin','guiowner@example.com'],capture_output=True,text=True,check=True)
   with app.db() as c:
    self.assertEqual(c.execute("SELECT count(*) FROM audit WHERE action='bootstrap:promote-admin' AND target=?",(str(u['id']),)).fetchone()[0],1)
+ def test_gateway_admin_secrets_permissions_and_modes(self):
+  from unittest.mock import patch
+  from cryptography.fernet import Fernet
+  import gateway_admin,payments
+  _,admin_user,admin=self.req('signup',{'name':'Gateway Admin','email':'gatewayadmin@example.com','password':'longpassword123'})
+  _,member,buyer=self.req('signup',{'name':'Gateway Member','email':'gatewaymember@example.com','password':'longpassword123'})
+  with app.db() as c:
+   c.execute("UPDATE users SET role='superadmin' WHERE id=?",(admin_user['id'],))
+   tid=c.execute("INSERT INTO tenants(name,slug,created) VALUES('Gateway market','gateway-market',0)").lastrowid
+   c.execute("INSERT INTO memberships VALUES(?,?,'admin')",(tid,member['id']))
+  self.assertEqual(self.req('admin/gateways')[0],403)
+  self.assertEqual(self.req('admin/gateways',cookie=buyer,tenant=tid)[0],403)
+  payload={'action':'save','tenant_id':tid,'gateway':'stripe','mode':'test','secret':'sk_test_fixtureGateway123','webhook_secret':'whsec_fixtureGateway123','public_key':'pk_test_fixtureGateway123','label':'Sandbox','payments_enabled':True,'enabled':True,'allow_live':False,'current_password':'longpassword123'}
+  self.assertEqual(self.req('admin/gateways',payload,buyer,tenant=tid)[0],403)
+  with tempfile.TemporaryDirectory() as root:
+   key=os.path.join(root,'gateway.key')
+   from pathlib import Path
+   Path(key).write_bytes(Fernet.generate_key())
+   with patch.dict(os.environ,{'NEARMARKET_GATEWAY_KEY_FILE':key,'NEARMARKET_ALLOW_LIVE_PAYMENTS':'0'}):
+    self.assertEqual(self.req('admin/gateways',{**payload,'current_password':'wrong'},admin)[0],403)
+    self.assertEqual(self.req('admin/gateways',payload,admin)[0],200)
+    response=self.req('admin/gateways',cookie=admin)[1]
+    encoded=json.dumps(response);self.assertNotIn(payload['secret'],encoded);self.assertNotIn(payload['webhook_secret'],encoded)
+    record=next(t for t in response['tenants'] if t['id']==tid)
+    self.assertTrue(record['gateways']['stripe']['ready'])
+    with app.db() as c:
+     row=c.execute("SELECT * FROM gateway_configs WHERE tenant_id=? AND gateway='stripe' AND mode='test'",(tid,)).fetchone()
+     self.assertNotIn(payload['secret'],json.dumps(dict(row)))
+     dump='\n'.join(c.iterdump())
+     self.assertNotIn(payload['secret'],dump);self.assertNotIn(payload['webhook_secret'],dump)
+     t=dict(c.execute('SELECT * FROM tenants WHERE id=?',(tid,)).fetchone())
+    self.assertEqual(gateway_admin.read_secret(tid,'stripe',mode='test'),payload['secret'])
+    paystack={**payload,'gateway':'paystack','secret':'sk_test_paystackFixture123','webhook_secret':'','public_key':'pk_test_paystackFixture123'}
+    self.assertEqual(self.req('admin/gateways',paystack,admin)[0],200)
+    self.assertEqual(gateway_admin.read_secret(tid,'paystack',mode='test'),paystack['secret'])
+    self.assertEqual(self.req('admin/gateways',{**payload,'mode':'live','secret':'','webhook_secret':''},admin)[0],400)
+    with patch.object(gateway_admin,'provider_check',return_value=(True,'API connection verified')) as check:
+     self.assertTrue(self.req('admin/gateways',{'action':'check','tenant_id':tid,'gateway':'stripe','mode':'test','current_password':'longpassword123'},admin)[1]['ok'])
+     self.assertEqual(check.call_args.args[1],payload['secret'])
+    live={**payload,'mode':'live','secret':'sk_live_fixtureGateway123','webhook_secret':'whsec_fixtureLive12345','public_key':'pk_live_fixtureGateway123','allow_live':True}
+    self.assertEqual(self.req('admin/gateways',live,admin)[0],200)
+    self.assertFalse(payments.gateway_status(t)['stripe']['ready'])
+    with patch.dict(os.environ,{'NEARMARKET_ALLOW_LIVE_PAYMENTS':'1'}):self.assertTrue(payments.gateway_status(t)['stripe']['ready'])
+    self.assertEqual(gateway_admin.read_secret(tid,'stripe',mode='test'),payload['secret'])
+    # Switching active mode does not stop authenticated test-mode webhook verification.
+    import hmac,hashlib,time
+    raw=b'{}';stamp=str(int(time.time()));digest=hmac.new(payload['webhook_secret'].encode(),stamp.encode()+b'.'+raw,hashlib.sha256).hexdigest()
+    self.assertTrue(payments.signature('stripe',raw,{'Stripe-Signature':f't={stamp},v1={digest}'},t,'test'))
+    self.assertFalse(payments.signature('stripe',raw,{'Stripe-Signature':f't={stamp},v1={digest}'},t,'live'))
+    self.assertEqual(self.req('admin/gateways',{'action':'clear','tenant_id':tid,'gateway':'stripe','mode':'live','current_password':'longpassword123'},admin)[0],200)
+    with patch.dict(os.environ,{f'NEARMARKET_T{tid}_STRIPE_SECRET':'sk_live_environment123',f'NEARMARKET_T{tid}_STRIPE_WEBHOOK_SECRET':'whsec_environment123'}):
+     self.assertEqual(gateway_admin.read_secret(tid,'stripe',mode='live'),'')
+     self.assertEqual(self.req('admin/gateways',{'action':'import','tenant_id':tid,'gateway':'stripe','mode':'live','current_password':'longpassword123'},admin)[0],200)
+     self.assertEqual(gateway_admin.read_secret(tid,'stripe',mode='live'),'sk_live_environment123')
+    # Ciphertext is authenticated to its tenant, gateway, field and environment.
+    with app.db() as c:
+     cipher=c.execute("SELECT secret_cipher FROM gateway_configs WHERE tenant_id=? AND gateway='stripe' AND mode='test'",(tid,)).fetchone()[0]
+     c.execute("UPDATE gateway_configs SET secret_cipher=? WHERE tenant_id=? AND gateway='stripe' AND mode='live'",(cipher,tid))
+    with self.assertRaises(ValueError):gateway_admin.read_secret(tid,'stripe',mode='live')
+    with patch.dict(os.environ,{'NEARMARKET_GATEWAY_KEY_FILE':os.path.join(root,'missing')}):
+     self.assertEqual(self.req('admin/gateways',payload,admin)[0],400)
+    # Reauthentication is throttled independently from normal sign-in.
+    for i in range(5):self.assertEqual(self.req('admin/gateways',{**payload,'current_password':'wrong'},admin)[0],403)
+    self.assertEqual(self.req('admin/gateways',payload,admin)[0],429)
  def test_permissions_and_marketplace(self):
   _,u,s=self.req('signup',{'name':'Seller','email':'s@example.com','password':'longpassword123'})
   _,v,b=self.req('signup',{'name':'Buyer','email':'b@example.com','password':'longpassword123'})

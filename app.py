@@ -1,4 +1,4 @@
-import tenants, payments
+import tenants, payments, gateway_admin
 import os, sqlite3, json, secrets, hashlib, hmac, math, time, re, argparse
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -72,11 +72,11 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith('/api/'):
             self.api('GET'); return
         path=urlparse(self.path).path
-        files={route:'index.html' for route in ('/','/admin','/admin/','/admin/api','/admin/keys','/admin/api-keys')}
-        files.update({'/app.js':'app.js','/style.css':'style.css'})
+        files={route:'index.html' for route in ('/','/admin','/admin/','/admin/api','/admin/keys','/admin/api-keys','/admin/payment-gateways')}
+        files.update({'/app.js':'app.js','/gateway-gui.js':'gateway-gui.js','/style.css':'style.css'})
         if path not in files:self.send(404,{'error':'Not found'});return
         raw=(ROOT/'static'/files[path]).read_bytes(); self.send_response(200)
-        self.send_header('Content-Type',{'index.html':'text/html; charset=utf-8','app.js':'text/javascript','style.css':'text/css'}[files[path]])
+        self.send_header('Content-Type',{'index.html':'text/html; charset=utf-8','app.js':'text/javascript','gateway-gui.js':'text/javascript','style.css':'text/css'}[files[path]])
         self.send_header('Cache-Control','no-store')
         self.send_header('X-Content-Type-Options','nosniff'); self.send_header('Referrer-Policy','same-origin')
         self.send_header('Content-Security-Policy',"default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; base-uri 'none'; frame-ancestors 'none'")
@@ -106,9 +106,10 @@ class Handler(BaseHTTPRequestHandler):
             with db() as c:
                 u=self.user(c); route=p.path
                 t=tenants.selected(self,c)
-                public_routes=('/api/tenants','/api/login','/api/signup','/api/me','/api/logout','/api/health','/api/admin')
+                public_routes=('/api/tenants','/api/login','/api/signup','/api/me','/api/logout','/api/health','/api/admin','/api/admin/gateways')
                 if not t['public'] and not tenants.member(c,u,t) and route not in public_routes and not route.startswith('/api/v1/'):
                     self.send(403,{'error':'Private marketplace membership required'});return
+                if gateway_admin.handle(self,c,u,route,method,d):return
                 if tenants.handle(self,c,u,route,method,d,t):return
                 if payments.handle(self,c,u,route,method,d,t):return
                 if route=='/api/admin':
