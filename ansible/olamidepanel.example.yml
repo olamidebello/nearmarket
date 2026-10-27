@@ -1,0 +1,8 @@
+# Copy outside Git, then replace this domain and certificate contact.
+nearmarket_domain: nearmarket.example.com
+nearmarket_email: admin@example.com
+nearmarket_expected_ipv4: 154.16.170.86
+nearmarket_port: 18361
+nearmarket_ref: main
+nearmarket_publish_panel_inventory: true
+nearmarket_run_tests: true

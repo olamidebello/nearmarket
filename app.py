@@ -192,7 +192,7 @@ class Handler(BaseHTTPRequestHandler):
                     c.execute('UPDATE listings SET tenant_id=? WHERE id=?',(t['id'],cur.lastrowid))
                     c.execute('INSERT INTO audit(actor,action,target,created) VALUES(NULL,?,?,?)',('api_key:'+str(key['id'])+':create_listing',str(cur.lastrowid),time.time()))
                     self.send(201,{'id':cur.lastrowid});return
-                if route=='/api/health': self.send(200,{'status':'ok'});return
+                if route=='/api/health': self.send(200,{'status':'ok','application':'nearmarket','release':os.environ.get('NEARMARKET_RELEASE','development')});return
                 if route=='/api/me':self.send(200,dict(u) if u else None);return
                 if route in ('/api/signup','/api/login') and method=='POST':
                     email=str(d.get('email','')).strip().lower();pw=str(d.get('password',''))

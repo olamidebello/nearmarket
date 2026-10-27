@@ -68,10 +68,14 @@ Primary implementation references:
 - https://paystack.com/docs/payments/accept-payments/
 - https://paystack.com/docs/payments/webhooks/
 
+## Olamidepanel deployment
+
+Use [the deployment guide](deploy/OLAMIDEPANEL.md), `ansible/deploy-olamidepanel.yml`, and `scripts/deploy-olamidepanel.sh` to pull from GitHub and deploy alongside the existing panel. Domain, certificate contact and server IPv4 are required inputs. The playbook backs up data, manages only NearMarket’s service/vhost, checks port/DNS conflicts, provisions HTTPS and registers verified status in the panel hosting inventory. It has not yet run on the live server.
+
 ## Operations and current limits
 `HOST=127.0.0.1`, `PORT=8080`, `NEARMARKET_DATA=./data`. Back up the SQLite database using SQLite backup tooling. Run behind TLS with secure cookies and private application ports. Configure reverse-proxy authentication rate limiting, 3 MB request size limits, process supervision and logs. The standard-library HTTP server is for development and a controlled pilot; a production server architecture is needed before high-volume use.
 
-Browser GPS requires HTTPS or localhost. Manual location accepts neighborhood coordinates; address geocoding is not configured. Coordinates round to two decimals. Photos are at most 2 MB. Browse caps at 1,000 listings per tenant; administration/orders show recent records. Pagination, object storage, email verification/reset, notifications, identity verification, advanced fraud controls and full production deployment remain future work. Generated branding images are separate deliverables and are not yet embedded into the website.
+Browser GPS requires HTTPS or localhost. Manual location accepts neighborhood coordinates; address geocoding is not configured. Coordinates round to two decimals. Photos are at most 2 MB. Browse caps at 1,000 listings per tenant; administration/orders show recent records. Pagination, object storage, email verification/reset, notifications, identity verification, advanced fraud controls and production load validation remain future work. Generated branding images are separate deliverables and are not yet embedded into the website.
 
 ## Verification
 ```sh

@@ -1,0 +1,136 @@
+---
+- name: Pull and deploy NearMarket alongside Olamidepanel
+  hosts: all
+  become: true
+  gather_facts: true
+  serial: 1
+  vars:
+    nearmarket_domain: ''
+    nearmarket_email: ''
+    nearmarket_expected_ipv4: '{{ ansible_default_ipv4.address | default("") }}'
+    nearmarket_port: 18361
+    nearmarket_ref: main
+    nearmarket_publish_panel_inventory: true
+    nearmarket_run_tests: true
+  pre_tasks:
+    - name: Require explicit domain, certificate contact and supported host
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == 'Debian'
+          - ansible_distribution_major_version | int >= 12
+          - not ansible_check_mode
+          - nearmarket_domain is match('^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$')
+          - nearmarket_domain | length <= 253
+          - nearmarket_email is match('^[^\s@]+@[^\s@]+\.[^\s@]+$')
+          - nearmarket_expected_ipv4 | length > 0
+          - nearmarket_ref is match('^[A-Za-z0-9][A-Za-z0-9/._-]*$')
+          - nearmarket_port | int >= 1024
+          - nearmarket_port | int <= 65535
+        fail_msg: >-
+          Set nearmarket_domain, nearmarket_email and nearmarket_expected_ipv4 for this
+          Debian Olamidepanel host. Check mode is intentionally unsupported; use --syntax-check.
+    - name: Check existing panel Nginx configuration before any installation
+      ansible.builtin.command:
+        argv: [/usr/sbin/nginx, -t]
+      changed_when: false
+    - name: Require the existing shared Nginx service to be active
+      ansible.builtin.command:
+        argv: [systemctl, is-active, nginx.service]
+      changed_when: false
+  tasks:
+    - name: Install application and certificate prerequisites only
+      ansible.builtin.apt:
+        name: [git, python3, ca-certificates, curl, certbot, dnsutils, iproute2]
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+        policy_rc_d: 101
+    - name: Create unprivileged NearMarket service account
+      ansible.builtin.user:
+        name: nearmarket
+        system: true
+        create_home: false
+        home: /var/lib/nearmarket
+        shell: /usr/sbin/nologin
+    - name: Create root-owned deployment and application directories
+      ansible.builtin.file:
+        path: '{{ item.path }}'
+        state: directory
+        owner: root
+        group: root
+        mode: '{{ item.mode }}'
+      loop:
+        - {path: /opt/nearmarket, mode: '0755'}
+        - {path: /opt/nearmarket/releases, mode: '0755'}
+        - {path: /etc/nearmarket, mode: '0700'}
+        - {path: /var/lib/nearmarket-deploy, mode: '0700'}
+        - {path: /var/backups/nearmarket, mode: '0700'}
+        - {path: /usr/local/lib/nearmarket-deploy, mode: '0755'}
+        - {path: /var/lib/nearmarket-acme, mode: '0755'}
+    - name: Create persistent application storage outside the checkout
+      ansible.builtin.file:
+        path: /var/lib/nearmarket
+        state: directory
+        owner: nearmarket
+        group: nearmarket
+        mode: '0700'
+    - name: Pull the selected repository revision without discarding local changes
+      ansible.builtin.git:
+        repo: https://github.com/olamidebello/nearmarket.git
+        dest: /opt/nearmarket/source
+        version: '{{ nearmarket_ref }}'
+        update: true
+        force: false
+        recursive: false
+      register: nearmarket_checkout
+    - name: Install the reviewed deployment worker
+      ansible.builtin.copy:
+        src: '{{ playbook_dir }}/../deploy/olamidepanel.py'
+        dest: /usr/local/lib/nearmarket-deploy/olamidepanel.py
+        owner: root
+        group: root
+        mode: '0755'
+    - name: Create a protected gateway environment file without replacing existing secrets
+      ansible.builtin.copy:
+        dest: /etc/nearmarket/secrets.env
+        owner: root
+        group: root
+        mode: '0600'
+        force: false
+        content: |
+          # Gateway credentials belong here, not in Git or playbook command lines.
+          # NEARMARKET_T1_STRIPE_SECRET=your_test_secret
+          # NEARMARKET_T1_STRIPE_WEBHOOK_SECRET=your_endpoint_secret
+          # NEARMARKET_T1_PAYSTACK_SECRET=your_test_secret
+          # Live payments remain off unless deliberately enabled after testing.
+          # NEARMARKET_ALLOW_LIVE_PAYMENTS=1
+      no_log: true
+    - name: Write deployment policy without payment credentials
+      ansible.builtin.copy:
+        dest: /var/lib/nearmarket-deploy/config.json
+        owner: root
+        group: root
+        mode: '0600'
+        content: >-
+          {{ {'domain': nearmarket_domain, 'email': nearmarket_email,
+          'expected_ipv4': nearmarket_expected_ipv4, 'port': nearmarket_port | int,
+          'commit': nearmarket_checkout.after,
+          'publish_panel_inventory': nearmarket_publish_panel_inventory | bool,
+          'run_tests': nearmarket_run_tests | bool} | to_nice_json }}
+    - name: Deploy with backups, rollback, HTTPS and application identity checks
+      ansible.builtin.command:
+        argv: [/usr/bin/python3, /usr/local/lib/nearmarket-deploy/olamidepanel.py, --config, /var/lib/nearmarket-deploy/config.json]
+      async: 1200
+      poll: 5
+      register: nearmarket_deployment
+      changed_when: (nearmarket_deployment.stdout | default('{}', true) | from_json).changed | default(false)
+      failed_when: false
+    - name: Show deployment outcome and report location
+      ansible.builtin.debug:
+        msg: '{{ nearmarket_deployment.stdout | default(nearmarket_deployment.msg | default("No worker output; inspect /var/lib/nearmarket-deploy/report.json")) }}'
+    - name: Require verified deployment success
+      ansible.builtin.assert:
+        that: nearmarket_deployment.rc | default(1) == 0
+        fail_msg: >-
+          Deployment did not complete. Read /var/lib/nearmarket-deploy/report.json and
+          journalctl -u nearmarket.service. No unrelated websites or services were removed.
