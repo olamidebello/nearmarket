@@ -1,0 +1,9 @@
+# NearMarket deployment on the Olamidepanel host.
+# DNS must point to this server before running; no credentials are stored here.
+nearmarket_domain: nearmarket.africandroid.world
+nearmarket_email: dobcalldemo@gmail.com
+nearmarket_expected_ipv4: 154.16.170.86
+nearmarket_port: 18361
+nearmarket_ref: main
+nearmarket_publish_panel_inventory: true
+nearmarket_run_tests: true
