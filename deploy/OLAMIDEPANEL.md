@@ -113,3 +113,9 @@ Application and deployment safety tests, Python compilation, shell syntax and An
 If the old report shows `backend_verified: true`, `stage: https` and `curl (exit 22)`, the backend and DNS passed but the old script did not record which web check failed. Pull this update and rerun the same production playbook. The update retries ACME/TLS checks after Nginx reload and accommodates existing address-specific listener groups. It does not disable HTTPS verification or remove other sites.
 
 If it still fails, the report now distinguishes `acme_http_routing`, `certificate_issuance`, `local_https_verification` and `public_https_verification`. Inspect the recorded `acme_probe` address/status results and `/var/log/nginx/error.log` for a persistent routing or filesystem-permission problem. No DNS edit is needed when both reported resolvers already show the correct IPv4 and no AAAA.
+
+## Enter Stripe credentials without exposing them
+
+Rotate any credentials that were pasted into chat or otherwise exposed. From an interactive root terminal on the deployed server, run `python3 scripts/configure-stripe.py --tenant 1` and enter a test key and the endpoint signing secret at the hidden prompts. For replacement live keys, explicitly pass `--enable-live`. This sets the existing global live-payment gate, affecting all configured live gateways; it does not enable an individual tenant.
+
+The helper preserves other environment settings, writes the selected tenant's credentials only to the root-only server file, and restarts NearMarket. It does not send credentials over chat, accept them as arguments, create Stripe accounts/webhook endpoints, or claim provider verification. Enable payments/Stripe separately in the tenant admin GUI. Webhook path for tenant 1: `/api/webhooks/stripe/1`. Keep the endpoint's signing secret matched to its Stripe environment and configured events.
