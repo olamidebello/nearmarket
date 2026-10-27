@@ -13,6 +13,24 @@ class Market(unittest.TestCase):
   try:
    with urllib.request.urlopen(req) as r:return r.status,json.load(r),r.headers.get('Set-Cookie','').split(';')[0]
   except urllib.error.HTTPError as e:return e.code,json.load(e),''
+ def test_admin_gui_routes_and_role_activation(self):
+  import subprocess
+  for path in ('/admin','/admin/api-keys','/admin/api','/admin/keys'):
+   with urllib.request.urlopen('http://127.0.0.1:'+str(self.s.server_port)+path) as response:
+    self.assertEqual(response.status,200)
+    self.assertIn('text/html',response.headers['Content-Type'])
+    self.assertEqual(response.headers['Cache-Control'],'no-store')
+    self.assertIn('id="apiKeys" hidden',response.read().decode())
+  self.assertEqual(self.req('admin')[0],403)
+  _,u,cookie=self.req('signup',{'name':'GUI Owner','email':'guiowner@example.com','password':'longpassword123'})
+  self.assertEqual(self.req('admin',{'action':'create_key','name':'Unauthorized','scopes':['listings:read'],'days':30},cookie)[0],403)
+  cli=subprocess.run([sys.executable,app.__file__,'--promote-admin','guiowner@example.com'],capture_output=True,text=True,check=True)
+  self.assertIn('/admin/api-keys',cli.stdout)
+  self.assertEqual(self.req('me',cookie=cookie)[1]['role'],'superadmin')
+  self.assertEqual(self.req('admin',cookie=cookie)[0],200)
+  subprocess.run([sys.executable,app.__file__,'--promote-admin','guiowner@example.com'],capture_output=True,text=True,check=True)
+  with app.db() as c:
+   self.assertEqual(c.execute("SELECT count(*) FROM audit WHERE action='bootstrap:promote-admin' AND target=?",(str(u['id']),)).fetchone()[0],1)
  def test_permissions_and_marketplace(self):
   _,u,s=self.req('signup',{'name':'Seller','email':'s@example.com','password':'longpassword123'})
   _,v,b=self.req('signup',{'name':'Buyer','email':'b@example.com','password':'longpassword123'})

@@ -72,10 +72,12 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith('/api/'):
             self.api('GET'); return
         path=urlparse(self.path).path
-        files={'/':'index.html','/app.js':'app.js','/style.css':'style.css'}
+        files={route:'index.html' for route in ('/','/admin','/admin/','/admin/api','/admin/keys','/admin/api-keys')}
+        files.update({'/app.js':'app.js','/style.css':'style.css'})
         if path not in files:self.send(404,{'error':'Not found'});return
         raw=(ROOT/'static'/files[path]).read_bytes(); self.send_response(200)
-        self.send_header('Content-Type',{'/':'text/html; charset=utf-8','/app.js':'text/javascript','/style.css':'text/css'}[path])
+        self.send_header('Content-Type',{'index.html':'text/html; charset=utf-8','app.js':'text/javascript','style.css':'text/css'}[files[path]])
+        self.send_header('Cache-Control','no-store')
         self.send_header('X-Content-Type-Options','nosniff'); self.send_header('Referrer-Policy','same-origin')
         self.send_header('Content-Security-Policy',"default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; base-uri 'none'; frame-ancestors 'none'")
         self.end_headers();self.wfile.write(raw)
@@ -275,7 +277,10 @@ if __name__=='__main__':
     parser=argparse.ArgumentParser();parser.add_argument('--promote-admin',metavar='EMAIL');args=parser.parse_args()
     if args.promote_admin:
         with db() as c:
-            changed=c.execute("UPDATE users SET role='superadmin',disabled=0 WHERE email=?",(args.promote_admin.lower(),)).rowcount
-        if not changed:raise SystemExit('Create the account first, then promote it.')
-        print('Super admin enabled.');raise SystemExit(0)
+            row=c.execute('SELECT id,role,disabled FROM users WHERE email=?',(args.promote_admin.strip().lower(),)).fetchone()
+            if row is None:raise SystemExit('Create the account on the website first, then promote that email.')
+            if row['role']!='superadmin' or row['disabled']:
+                c.execute("UPDATE users SET role='superadmin',disabled=0 WHERE id=?",(row['id'],))
+                c.execute('INSERT INTO audit(actor,action,target,created) VALUES(NULL,?,?,?)',('bootstrap:promote-admin',str(row['id']),time.time()))
+        print('Super admin enabled. Open /admin/api-keys after signing in.');raise SystemExit(0)
     ThreadingHTTPServer((os.environ.get('HOST','127.0.0.1'),int(os.environ.get('PORT','8080'))),Handler).serve_forever()

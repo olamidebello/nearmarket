@@ -14,7 +14,7 @@ Open http://127.0.0.1:8080. Create an account, then enable the first super admin
 ```sh
 python3 app.py --promote-admin you@example.com
 ```
-Account → Super admin dashboard. No default credentials, inventory, provider accounts or live payments are created.
+Open `/admin/api-keys` directly, or use the **Super admin** and **API & keys** header shortcuts after signing in with an authorized account. The Account menu also links to the dashboard. On the deployed server, `bash scripts/enable-superadmin.sh` prompts for the email of an existing account and grants access through the protected local CLI; it never creates a default admin or password. Existing sessions refresh permissions when the browser regains focus. No default credentials, inventory, provider accounts or live payments are created.
 
 ## Administrator GUI
 Tabs: overview, users, listings, reports, keys, tenants and audit. Suspend users, grant/revoke global roles, moderate listings, resolve reports, and inspect recent administrative activity. Self-demotion and self-suspension are blocked. Paid/pending listings cannot be reopened through moderation or seller edits.

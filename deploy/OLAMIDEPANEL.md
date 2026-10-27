@@ -85,6 +85,8 @@ sudo -u nearmarket env NEARMARKET_DATA=/var/lib/nearmarket \
   python3 /opt/nearmarket/current/app.py --promote-admin YOUR_ACCOUNT_EMAIL
 ```
 
+Alternatively, run `bash scripts/enable-superadmin.sh` from the deployment checkout; it prompts for your registered email. Then sign in at `https://nearmarket.africandroid.world/admin/api-keys`. Only accounts with the server-verified `superadmin` role can use the controls.
+
 Gateway secrets are never accepted in the playbook command line. Add them locally with a secure editor to `/etc/nearmarket/secrets.env` (root-only, `0600`) and restart:
 
 ```bash
