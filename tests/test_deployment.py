@@ -166,6 +166,56 @@ class DeploymentTests(unittest.TestCase):
             self.assertTrue((Path(report['backup']) / 'market.db').exists())
             self.assertFalse(any(call.args[0][:3] == ['systemctl', 'stop', 'nginx.service'] for call in commands.call_args_list))
 
+    def test_acme_probe_waits_for_new_nginx_workers(self):
+        calls = {'body': 0}
+        def response(argv, **kwargs):
+            if '--write-out' in argv:
+                return '503'
+            calls['body'] += 1
+            if calls['body'] <= 2:
+                raise d.DeploymentError('old worker response')
+            return 'NearMarket-ACME'
+        report = {}
+        with patch.object(d, 'run', side_effect=response), patch.object(d.time, 'sleep') as pause:
+            d.probe_acme(self.cfg, Path('probe-fixture'), report, attempts=3)
+        self.assertEqual(calls['body'], 3)
+        self.assertEqual(report['acme_verified_address'], self.cfg['expected_ipv4'])
+        pause.assert_called_once_with(1)
+
+    def test_acme_probe_can_use_loopback_if_public_hairpin_is_unavailable(self):
+        def response(argv, **kwargs):
+            if self.cfg['domain'] + ':80:127.0.0.1' in argv:
+                return 'NearMarket-ACME'
+            raise d.DeploymentError('unreachable fixture')
+        report = {}
+        with patch.object(d, 'run', side_effect=response):
+            d.probe_acme(self.cfg, Path('probe-fixture'), report, attempts=1)
+        self.assertEqual(report['acme_verified_address'], '127.0.0.1')
+
+    def test_acme_failure_reports_codes_without_response_bodies(self):
+        def response(argv, **kwargs):
+            if '--write-out' in argv:
+                return '403'
+            raise d.DeploymentError('fixture')
+        report = {}
+        with patch.object(d, 'run', side_effect=response), self.assertRaises(d.DeploymentError) as error:
+            d.probe_acme(self.cfg, Path('probe-fixture'), report, attempts=1)
+        self.assertIn('127.0.0.1=403', str(error.exception))
+        self.assertEqual(len(report['acme_probe']), 2)
+        self.assertEqual(report['acme_probe'][0]['http_status'], '403')
+
+    def test_listeners_join_only_existing_address_groups(self):
+        dump = 'server { listen 127.0.0.1:80; listen 192.0.2.10:443 ssl; listen 192.0.2.55:80; }'
+        policy = d.listener_policy(self.cfg, dump)
+        self.assertEqual(policy, {'80': ['127.0.0.1'], '443': ['192.0.2.10']})
+        text = d.nginx_text({**self.cfg, 'nginx_addresses': policy}, True)
+        self.assertIn('listen 127.0.0.1:80;', text)
+        self.assertIn('listen 192.0.2.10:443 ssl;', text)
+        self.assertNotIn('listen 192.0.2.10:80;', text)
+        self.assertNotIn('192.0.2.55', text)
+        with self.assertRaises(d.DeploymentError):
+            d.listener_policy(self.cfg, 'listen 127.0.0.1:80 proxy_protocol;')
+
 
 if __name__ == '__main__':
     unittest.main()

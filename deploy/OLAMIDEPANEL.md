@@ -57,11 +57,13 @@ Use `--ask-become-pass` for a non-root sudo account. Host-key verification remai
 5. Stops only `nearmarket.service`, backs up the persistent database and old configuration to `/var/backups/nearmarket/TIMESTAMP`, then switches `/opt/nearmarket/current`.
 6. Installs a root-owned systemd unit running as `nearmarket`, with a read-only application filesystem and write access only to its own data directory. Runtime data remains at `/var/lib/nearmarket` across releases.
 7. Checks the loopback application identity/release. It creates only `nearmarket-DOMAIN.conf` and its enabled symlink. The shared Nginx main configuration is not rewritten. HTTP serves ACME only until HTTPS is ready.
-8. Obtains/renews an isolated `nearmarket-DOMAIN` certificate using Certbot webroot. It validates Nginx before reload, then verifies local SNI/TLS and public HTTPS against the expected NearMarket release. Certificate validation is never bypassed.
+8. Obtains/renews an isolated `nearmarket-DOMAIN` certificate using Certbot webroot. It validates Nginx before reload, waits for the new workers using bounded routing retries, then verifies local SNI/TLS and public HTTPS against the expected NearMarket release. Certificate validation is never bypassed.
 9. Enables certificate renewal with an Nginx deploy hook. Adds proxy request limits and rate limiting for login, signup and pickup-code submission.
 10. Merges the verified domain into `/var/lib/olamidepanel/hosted-domains.json`, preserving unrelated rows. The panel's hosted-domain view can display the backend, commit, configuration and verified status. This does not grant a panel customer ownership of the domain or configure an authenticated panel API integration.
 
-Nginx rewrite/hosting automation elsewhere must not be configured to manage the same exact hostname. The preflight stops on a duplicate; migrate that site deliberately rather than running competing deployers. Changing NearMarket's domain also requires an explicit vhost migration; the script will not leave two conflicting NearMarket rate-limit zones loaded.
+Nginx rewrite/hosting automation elsewhere must not be configured to manage the same exact hostname. The generated site joins existing loopback/public-IP listener groups only when those groups already exist, preserving their other virtual hosts. ACME probes try the server IPv4 and loopback separately and record HTTP status codes without capturing response bodies.
+
+The preflight stops on a duplicate; migrate that site deliberately rather than running competing deployers. Changing NearMarket's domain also requires an explicit vhost migration; the script will not leave two conflicting NearMarket rate-limit zones loaded.
 
 ## Inspect actual outcome
 
@@ -103,3 +105,9 @@ The playbook retains old releases/backups and does not prune data. Initial migra
 ## Authoring verification
 
 Application and deployment safety tests, Python compilation, shell syntax and Ansible syntax were checked. Deployment tests cover conflicting DNS/ports, unsafe archives, file permissions, wrong application identity, and a failed-candidate rollback preserving application data. The playbook has not been executed on the live Olamidepanel host; real SSH, DNS, ACME, systemd and public HTTPS still require a server run.
+
+## Recovering from the first HTTPS deployment failure
+
+If the old report shows `backend_verified: true`, `stage: https` and `curl (exit 22)`, the backend and DNS passed but the old script did not record which web check failed. Pull this update and rerun the same production playbook. The update retries ACME/TLS checks after Nginx reload and accommodates existing address-specific listener groups. It does not disable HTTPS verification or remove other sites.
+
+If it still fails, the report now distinguishes `acme_http_routing`, `certificate_issuance`, `local_https_verification` and `public_https_verification`. Inspect the recorded `acme_probe` address/status results and `/var/log/nginx/error.log` for a persistent routing or filesystem-permission problem. No DNS edit is needed when both reported resolvers already show the correct IPv4 and no AAAA.

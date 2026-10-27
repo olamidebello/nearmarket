@@ -228,6 +228,60 @@ def environment(cfg):
             '\nNEARMARKET_RELEASE=' + cfg['commit'] + '\n')
 
 
+def listener_policy(cfg, dump):
+    """Join existing address-specific server groups without creating new groups."""
+    found = {80: [], 443: []}
+    text = re.sub(r'#[^\n]*', '', dump)
+    for value in re.findall(r'\blisten\s+([^;]+);', text):
+        endpoint = value.split()[0]
+        for port in found:
+            for address in ('127.0.0.1', cfg['expected_ipv4']):
+                if endpoint == address + ':' + str(port) and address not in found[port]:
+                    if 'proxy_protocol' in value.split():
+                        raise DeploymentError('Address-specific Nginx listener requires PROXY protocol; configure its routing explicitly')
+                    found[port].append(address)
+    return {str(port): addresses for port, addresses in found.items()}
+
+
+def listen_lines(cfg, port, tls=False):
+    suffix = ' ssl' if tls else ''
+    addresses = cfg.get('nginx_addresses', {}).get(str(port), [])
+    lines = ['    listen ' + str(port) + suffix + ';']
+    lines.extend('    listen ' + address + ':' + str(port) + suffix + ';' for address in addresses)
+    return '\n'.join(lines)
+
+
+def probe_acme(cfg, probe, report, attempts=12):
+    """Wait for new workers; probe the public listener and loopback independently."""
+    domain = cfg['domain']
+    url = 'http://' + domain + '/.well-known/acme-challenge/' + probe.name
+    report['acme_probe'] = []
+    for attempt in range(attempts):
+        results = []
+        for address in dict.fromkeys((cfg['expected_ipv4'], '127.0.0.1')):
+            args = ['curl', '--silent', '--show-error', '--noproxy', '*',
+                    '--connect-timeout', '2', '--max-time', '4',
+                    '--resolve', domain + ':80:' + address]
+            try:
+                content = run([*args, '--fail', url], timeout=6)
+                if content == 'NearMarket-ACME':
+                    report['acme_probe'] = results + [{'address': address, 'verified': True}]
+                    report['acme_verified_address'] = address
+                    return
+                results.append({'address': address, 'error': 'Wrong response body'})
+            except DeploymentError:
+                try:
+                    status = run([*args, '--output', '/dev/null', '--write-out', '%{http_code}', url], timeout=6).strip()
+                except DeploymentError:
+                    status = 'unreachable'
+                results.append({'address': address, 'http_status': status if re.fullmatch('[0-9]{3}', status) else 'unreachable'})
+        report['acme_probe'] = results
+        if attempt + 1 < attempts:
+            time.sleep(1)
+    details = ', '.join(r['address'] + '=' + r.get('http_status', r.get('error', 'failed')) for r in report['acme_probe'])
+    raise DeploymentError('ACME HTTP routing failed after reload retries (' + details + '). Check the managed vhost and /var/log/nginx/error.log; no certificate was requested.')
+
+
 def nginx_text(cfg, tls):
     domain, port = cfg['domain'], cfg['port']
     cert = Path('/etc/letsencrypt/live') / ('nearmarket-' + domain)
@@ -242,7 +296,7 @@ def nginx_text(cfg, tls):
 '''
     text = MARK + '''limit_req_zone $binary_remote_addr zone=nearmarket_auth:10m rate=10r/m;
 server {
-    listen 80;
+''' + listen_lines(cfg, 80) + '''
     server_name ''' + domain + ''';
     location ^~ /.well-known/acme-challenge/ {
         root /var/lib/nearmarket-acme;
@@ -254,7 +308,7 @@ server {
     if not tls:
         return text
     text += f'''server {{
-    listen 443 ssl;
+{listen_lines(cfg, 443, True)}
     server_name {domain};
     ssl_certificate {cert}/fullchain.pem;
     ssl_certificate_key {cert}/privkey.pem;
@@ -325,6 +379,8 @@ def deploy(cfg, report):
         raise DeploymentError('Existing shared Nginx must be running')
     dump = run(['/usr/sbin/nginx', '-T'])
     check_nginx(domain, target, link, dump)
+    cfg['nginx_addresses'] = listener_policy(cfg, dump)
+    report['nginx_addresses'] = cfg['nginx_addresses']
     check_port(cfg['port'])
     report['dns'] = check_dns(domain, cfg['expected_ipv4'])
     if cfg.get('publish_panel_inventory', True):
@@ -401,19 +457,27 @@ def deploy(cfg, report):
         challenge_dir.chmod(0o755)
         probe = challenge_dir / ('nearmarket-' + str(time.time_ns()))
         atomic(probe, 'NearMarket-ACME')
+        report['stage'] = 'acme_http_routing'
         try:
-            challenge = run(['curl', '--fail', '--silent', '--show-error', '--noproxy', '*', '--max-time', '15', '--resolve', domain + ':80:127.0.0.1', 'http://' + domain + '/.well-known/acme-challenge/' + probe.name], timeout=20)
-            if challenge != 'NearMarket-ACME':
-                raise DeploymentError('Local ACME routing did not reach NearMarket')
+            probe_acme(cfg, probe, report)
         finally:
             probe.unlink(missing_ok=True)
+        report['stage'] = 'certificate_issuance'
         run(['certbot', 'certonly', '--webroot', '--webroot-path', ACME,
              '--non-interactive', '--agree-tos', '--email', cfg['email'],
              '--cert-name', 'nearmarket-' + domain, '--keep-until-expiring', '-d', domain], timeout=360)
         atomic(target, nginx_text(cfg, True))
         reload_nginx(target)
-        health(cfg, https=True)
+        report['stage'] = 'local_https_verification'
+        for attempt in range(12):
+            try:
+                health(cfg, https=True)
+                break
+            except (DeploymentError, ValueError):
+                if attempt == 11:raise
+                time.sleep(1)
         report['local_https_verified'] = True
+        report['stage'] = 'public_https_verification'
         health(cfg, https=True, public=True)
         report['public_https_verified'] = True
         hook = Path('/etc/letsencrypt/renewal-hooks/deploy/nearmarket-nginx')
