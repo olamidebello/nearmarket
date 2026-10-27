@@ -1,3 +1,4 @@
+import tenants, payments
 import os, sqlite3, json, secrets, hashlib, hmac, math, time, re, argparse
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -19,11 +20,20 @@ def init():
         CREATE TABLE IF NOT EXISTS favorites(user_id INTEGER REFERENCES users(id),listing INTEGER REFERENCES listings(id),PRIMARY KEY(user_id,listing));
         CREATE TABLE IF NOT EXISTS reports(id INTEGER PRIMARY KEY,user_id INTEGER REFERENCES users(id),listing INTEGER REFERENCES listings(id),reason TEXT,created REAL);
         CREATE TABLE IF NOT EXISTS api_keys(id INTEGER PRIMARY KEY,name TEXT,key_hash TEXT UNIQUE,prefix TEXT,scopes TEXT,expires REAL,revoked INTEGER DEFAULT 0,created REAL,last_used REAL);
+        CREATE TABLE IF NOT EXISTS settings(name TEXT PRIMARY KEY,value TEXT);
+        CREATE TABLE IF NOT EXISTS api_usage(key_id INTEGER,minute INTEGER,count INTEGER,PRIMARY KEY(key_id,minute));
         CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,actor INTEGER,action TEXT,target TEXT,created REAL);
         ''')
         cols={r[1] for r in c.execute('PRAGMA table_info(users)')}
         if 'role' not in cols:c.execute("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'user'")
         if 'disabled' not in cols:c.execute('ALTER TABLE users ADD COLUMN disabled INTEGER DEFAULT 0')
+        keycols={r[1] for r in c.execute('PRAGMA table_info(api_keys)')}
+        for name,definition in {'rpm':'INTEGER DEFAULT 60','requests':'INTEGER DEFAULT 0','seller_id':'INTEGER REFERENCES users(id)'}.items():
+            if name not in keycols:c.execute(f'ALTER TABLE api_keys ADD COLUMN {name} {definition}')
+        c.execute("INSERT OR IGNORE INTO settings VALUES('api_enabled','1')")
+        c.execute('DELETE FROM api_usage WHERE minute<?',(int(time.time()//60)-1440,))
+        tenants.init(c);payments.init(c)
+
 
 def distance(a,b,x,y):
     p,q=math.radians(a),math.radians(x)
@@ -69,7 +79,18 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('X-Content-Type-Options','nosniff'); self.send_header('Referrer-Policy','same-origin')
         self.send_header('Content-Security-Policy',"default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; base-uri 'none'; frame-ancestors 'none'")
         self.end_headers();self.wfile.write(raw)
-    def do_POST(self):self.api('POST')
+    def do_POST(self):
+        if self.path.startswith('/api/webhooks/'):
+            try:
+                parts=urlparse(self.path).path.split('/')
+                require(len(parts)==5 and parts[3] in ('stripe','paystack'),'Invalid webhook route')
+                size=int(self.headers.get('Content-Length',0));require(0<size<=1000000,'Invalid payload size')
+                raw=self.rfile.read(size)
+                with db() as c:payments.webhook(self,c,parts[3],int(parts[4]),raw)
+            except (ValueError,KeyError,TypeError):self.send(400,{'error':'Invalid webhook payload'})
+            except Exception:self.send(500,{'error':'Webhook processing failed'})
+            return
+        self.api('POST')
     def api(self,method):
         try:
             p=urlparse(self.path); q=parse_qs(p.query); d={}
@@ -82,24 +103,51 @@ class Handler(BaseHTTPRequestHandler):
                 d=json.loads(self.rfile.read(size)); require(isinstance(d,dict),'Invalid request')
             with db() as c:
                 u=self.user(c); route=p.path
-                if route.startswith('/api/admin'):
+                t=tenants.selected(self,c)
+                public_routes=('/api/tenants','/api/login','/api/signup','/api/me','/api/logout','/api/health','/api/admin')
+                if not t['public'] and not tenants.member(c,u,t) and route not in public_routes and not route.startswith('/api/v1/'):
+                    self.send(403,{'error':'Private marketplace membership required'});return
+                if tenants.handle(self,c,u,route,method,d,t):return
+                if payments.handle(self,c,u,route,method,d,t):return
+                if route=='/api/admin':
                     if not u or u['role']!='superadmin':self.send(403,{'error':'Super admin access required'});return
                     if method=='GET':
                         self.send(200,{
                             'users':[dict(r) for r in c.execute('SELECT id,name,email,role,disabled FROM users')],
                             'listings':[dict(r) for r in c.execute('SELECT id,title,seller,status,area FROM listings ORDER BY id DESC LIMIT 500')],
                             'reports':[dict(r) for r in c.execute('SELECT * FROM reports ORDER BY id DESC LIMIT 500')],
-                            'keys':[dict(r) for r in c.execute('SELECT id,name,prefix,scopes,expires,revoked,created,last_used FROM api_keys')],
+                            'keys':[dict(r) for r in c.execute('SELECT id,name,prefix,scopes,expires,revoked,created,last_used,rpm,requests,seller_id,tenant_id FROM api_keys')],
+                            'api_enabled':c.execute("SELECT value FROM settings WHERE name='api_enabled'").fetchone()[0]=='1',
                             'audit':[dict(r) for r in c.execute('SELECT * FROM audit ORDER BY id DESC LIMIT 100')]
                         });return
                     action=d.get('action'); target=str(d.get('id','')); extra={}
-                    if action=='create_key':
+                    if action=='api_toggle':
+                        require(isinstance(d.get('enabled'),bool),'Expected enabled boolean')
+                        c.execute("UPDATE settings SET value=? WHERE name='api_enabled'",('1' if d['enabled'] else '0',))
+                    elif action in ('create_key','edit_key'):
                         name=str(d.get('name','')).strip();require(2<=len(name)<=100,'Enter key name')
                         scopes=d.get('scopes',[]);require(isinstance(scopes,list) and len(scopes)>0 and all(x in ('listings:read','listings:write') for x in scopes),'Select valid scopes')
                         days=int(d.get('days',30));require(1<=days<=365,'Expiry must be 1–365 days')
+                        key_tenant=int(d.get('tenant_id',t['id']))
+                        require(c.execute('SELECT 1 FROM tenants WHERE id=? AND active=1',(key_tenant,)).fetchone(),'Choose an active marketplace')
+                        rpm=int(d.get('rpm',60));require(1<=rpm<=10000,'Rate limit must be 1–10000 requests per minute')
+                        seller_id=int(d['seller_id']) if d.get('seller_id') not in ('',None) else None
+                        if seller_id is not None:require(c.execute('SELECT 1 FROM users WHERE id=? AND disabled=0',(seller_id,)).fetchone(),'Select an active seller')
+                        if seller_id is not None:
+                            require(key_tenant==1 or c.execute('SELECT 1 FROM memberships WHERE tenant_id=? AND user_id=?',(key_tenant,seller_id)).fetchone(),'Seller must belong to the selected marketplace')
+                        if action=='create_key':
+                            secret='nm_'+secrets.token_urlsafe(32)
+                            cur=c.execute('INSERT INTO api_keys(name,key_hash,prefix,scopes,expires,created,rpm,seller_id,tenant_id) VALUES(?,?,?,?,?,?,?,?,?)',(name,hashlib.sha256(secret.encode()).hexdigest(),secret[:10],json.dumps(sorted(set(scopes))),time.time()+days*86400,time.time(),rpm,seller_id,key_tenant))
+                            target=str(cur.lastrowid);extra={'secret':secret}
+                        else:
+                            require(c.execute('SELECT 1 FROM api_keys WHERE id=? AND revoked=0',(int(target),)).fetchone(),'Active key not found')
+                            c.execute('UPDATE api_keys SET name=?,scopes=?,expires=?,rpm=?,seller_id=?,tenant_id=? WHERE id=?',(name,json.dumps(sorted(set(scopes))),time.time()+days*86400,rpm,seller_id,key_tenant,int(target)))
+                    elif action=='rotate_key':
+                        require(c.execute('SELECT 1 FROM api_keys WHERE id=? AND revoked=0 AND expires>?',(int(target),time.time())).fetchone(),'Active unexpired key not found')
                         secret='nm_'+secrets.token_urlsafe(32)
-                        cur=c.execute('INSERT INTO api_keys(name,key_hash,prefix,scopes,expires,created) VALUES(?,?,?,?,?,?)',(name,hashlib.sha256(secret.encode()).hexdigest(),secret[:10],json.dumps(scopes),time.time()+days*86400,time.time()))
-                        target=str(cur.lastrowid);extra={'secret':secret}
+                        c.execute('UPDATE api_keys SET key_hash=?,prefix=? WHERE id=?',(hashlib.sha256(secret.encode()).hexdigest(),secret[:10],int(target)))
+                        extra={'secret':secret}
+
                     elif action=='revoke_key':c.execute('UPDATE api_keys SET revoked=1 WHERE id=?',(int(target),))
                     elif action=='user':
                         uid=int(target);require(uid!=u['id'],'You cannot change your own admin access here')
@@ -108,6 +156,7 @@ class Handler(BaseHTTPRequestHandler):
                         c.execute('UPDATE users SET role=?,disabled=? WHERE id=?',(role,disabled,uid))
                         c.execute('DELETE FROM sessions WHERE user_id=?',(uid,))
                     elif action=='listing':
+                        require(not c.execute("SELECT 1 FROM orders WHERE listing=? AND status IN ('pending','paid')",(int(target),)).fetchone(),'A paid or pending order locks this listing')
                         status=d.get('status');require(status in ('available','reserved','sold','hidden'),'Invalid status')
                         c.execute('UPDATE listings SET status=? WHERE id=?',(status,int(target)))
                     elif action=='resolve_report':c.execute('DELETE FROM reports WHERE id=?',(int(target),))
@@ -115,18 +164,32 @@ class Handler(BaseHTTPRequestHandler):
                     c.execute('INSERT INTO audit(actor,action,target,created) VALUES(?,?,?,?)',(u['id'],action,target,time.time()))
                     self.send(200,{'ok':True,**extra});return
                 if route.startswith('/api/v1/'):
+                    if c.execute("SELECT value FROM settings WHERE name='api_enabled'").fetchone()[0]!='1':self.send(503,{'error':'Integration API is disabled by an administrator'});return
+                    c.execute('BEGIN IMMEDIATE')
                     secret=self.headers.get('Authorization','').removeprefix('Bearer ')
                     key=c.execute('SELECT * FROM api_keys WHERE key_hash=? AND revoked=0 AND expires>?',(hashlib.sha256(secret.encode()).hexdigest(),time.time())).fetchone()
                     if not key:self.send(401,{'error':'Invalid or expired API key'});return
+                    if key['tenant_id']!=t['id']:self.send(403,{'error':'Key belongs to another marketplace'});return
                     scope='listings:read' if method=='GET' else 'listings:write'
                     if scope not in json.loads(key['scopes']):self.send(403,{'error':'Key lacks required scope'});return
-                    c.execute('UPDATE api_keys SET last_used=? WHERE id=?',(time.time(),key['id']))
+                    if key['seller_id'] is not None and not c.execute('SELECT 1 FROM users WHERE id=? AND disabled=0',(key['seller_id'],)).fetchone():self.send(403,{'error':'Linked seller is suspended'});return
+                    minute=int(time.time()//60)
+                    usage=c.execute('SELECT count FROM api_usage WHERE key_id=? AND minute=?',(key['id'],minute)).fetchone()
+                    if usage and usage[0]>=key['rpm']:self.send(429,{'error':'Key rate limit exceeded; retry next minute'});return
+                    c.execute('INSERT INTO api_usage VALUES(?,?,1) ON CONFLICT(key_id,minute) DO UPDATE SET count=count+1',(key['id'],minute))
+                    c.execute('UPDATE api_keys SET last_used=?,requests=requests+1 WHERE id=?',(time.time(),key['id']))
+                    c.execute('DELETE FROM api_usage WHERE key_id=? AND minute<?',(key['id'],minute-1440))
                     if route!='/api/v1/listings':self.send(404,{'error':'Not found'});return
                     if method=='GET':
-                        self.send(200,[dict(r) for r in c.execute("SELECT id,title,description,price,currency,category,condition,area,lat,lon,status FROM listings WHERE status='available' ORDER BY id DESC LIMIT 100")]);return
+                        self.send(200,[dict(r) for r in c.execute("SELECT id,title,description,price,currency,category,condition,area,lat,lon,status FROM listings WHERE status='available' AND tenant_id=? ORDER BY id DESC LIMIT 100",(t['id'],))]);return
                     # Integrations can only post for a real active account selected explicitly.
-                    seller=int(d.get('seller',0));require(c.execute('SELECT 1 FROM users WHERE id=? AND disabled=0',(seller,)).fetchone(),'Select an active seller ID')
+                    seller=int(d.get('seller',key['seller_id'] or 0))
+                    if key['seller_id'] is not None and seller!=key['seller_id']:self.send(403,{'error':'Key is restricted to its linked seller'});return
+                    require(c.execute('SELECT 1 FROM users WHERE id=? AND disabled=0',(seller,)).fetchone(),'Select an active seller ID')
+                    require(t['id']==1 or c.execute('SELECT 1 FROM memberships WHERE tenant_id=? AND user_id=?',(t['id'],seller)).fetchone(),'Seller is not a marketplace member')
+                    tenants.capacity(c,t)
                     values=clean_listing(d);cur=c.execute('INSERT INTO listings(seller,title,description,price,currency,category,condition,area,lat,lon,image,created) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(seller,*values,time.time()))
+                    c.execute('UPDATE listings SET tenant_id=? WHERE id=?',(t['id'],cur.lastrowid))
                     c.execute('INSERT INTO audit(actor,action,target,created) VALUES(NULL,?,?,?)',('api_key:'+str(key['id'])+':create_listing',str(cur.lastrowid),time.time()))
                     self.send(201,{'id':cur.lastrowid});return
                 if route=='/api/health': self.send(200,{'status':'ok'});return
@@ -146,7 +209,7 @@ class Handler(BaseHTTPRequestHandler):
                     secure='; Secure' if os.environ.get('COOKIE_SECURE')=='1' else ''
                     self.send(200,{'id':row['id'],'name':row['name'],'role':row['role']},f'session={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800{secure}');return
                 if route=='/api/listings' and method=='GET':
-                    rows=c.execute('SELECT l.*,u.name seller_name FROM listings l JOIN users u ON l.seller=u.id ORDER BY created DESC LIMIT 1000').fetchall();result=[]
+                    rows=c.execute('SELECT l.*,u.name seller_name FROM listings l JOIN users u ON l.seller=u.id WHERE l.tenant_id=? ORDER BY created DESC LIMIT 1000',(t['id'],)).fetchall();result=[]
                     lat=coordinate(q['lat'][0],90) if 'lat' in q else None;lon=coordinate(q['lon'][0],180) if lat is not None else None
                     radius=float(q.get('radius',['25'])[0]);require(math.isfinite(radius) and 0<radius<=10000,'Invalid radius')
                     for r in rows:
@@ -166,17 +229,27 @@ class Handler(BaseHTTPRequestHandler):
                 if route=='/api/logout' and method=='POST':
                     c.execute('DELETE FROM sessions WHERE user_id=?',(u['id'],));self.send(200,{'ok':True},'session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0');return
                 if route=='/api/listings' and method=='POST':
-                    values=clean_listing(d);cur=c.execute('INSERT INTO listings(seller,title,description,price,currency,category,condition,area,lat,lon,image,created) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(u['id'],*values,time.time()));self.send(201,{'id':cur.lastrowid});return
+                    require(tenants.member(c,u,t),'Join this marketplace before selling')
+                    c.execute('BEGIN IMMEDIATE')
+                    tenants.capacity(c,t)
+                    values=clean_listing(d);cur=c.execute('INSERT INTO listings(seller,title,description,price,currency,category,condition,area,lat,lon,image,created) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(u['id'],*values,time.time()))
+                    c.execute('UPDATE listings SET tenant_id=?,online=? WHERE id=?',(t['id'],int(bool(d.get('online'))),cur.lastrowid))
+                    self.send(201,{'id':cur.lastrowid});return
                 if route=='/api/messages' and method=='GET':
-                    rows=c.execute('SELECT m.*,l.title,u.name sender_name FROM messages m JOIN listings l ON l.id=m.listing JOIN users u ON u.id=m.sender WHERE sender=? OR recipient=? ORDER BY created DESC LIMIT 500',(u['id'],u['id'])).fetchall();self.send(200,[dict(r) for r in rows]);return
+                    rows=c.execute('SELECT m.*,l.title,u.name sender_name FROM messages m JOIN listings l ON l.id=m.listing JOIN users u ON u.id=m.sender WHERE l.tenant_id=? AND (sender=? OR recipient=?) ORDER BY created DESC LIMIT 500',(t['id'],u['id'],u['id'])).fetchall();self.send(200,[dict(r) for r in rows]);return
                 if route in ('/api/status','/api/favorite','/api/messages','/api/report','/api/edit') and method=='POST':
-                    listing=c.execute('SELECT * FROM listings WHERE id=?',(int(d.get('listing',0)),)).fetchone();require(listing is not None,'Listing not found');lid=listing['id']
+                    listing=c.execute('SELECT * FROM listings WHERE id=? AND tenant_id=?',(int(d.get('listing',0)),t['id'])).fetchone();require(listing is not None,'Listing not found');lid=listing['id']
+                    require(tenants.member(c,u,t),'Marketplace membership required')
                     if route in ('/api/status','/api/edit'):
+                        require(not c.execute("SELECT 1 FROM orders WHERE listing=? AND status IN ('pending','paid')",(lid,)).fetchone(),'A paid or pending order locks this listing')
+                        require(listing['status']!='hidden','A moderator has hidden this listing')
                         require(listing['seller']==u['id'],'Only the seller can change this listing')
                         if route=='/api/edit':
-                            values=clean_listing(d);c.execute('UPDATE listings SET title=?,description=?,price=?,currency=?,category=?,condition=?,area=?,lat=?,lon=?,image=? WHERE id=?',(*values,lid))
+                            values=clean_listing(d);c.execute('UPDATE listings SET online=? WHERE id=?',(int(bool(d.get('online'))),lid));c.execute('UPDATE listings SET title=?,description=?,price=?,currency=?,category=?,condition=?,area=?,lat=?,lon=?,image=? WHERE id=?',(*values,lid))
                         else:
-                            require(d.get('status') in ('available','reserved','sold'),'Invalid status');c.execute('UPDATE listings SET status=? WHERE id=?',(d['status'],lid))
+                            require(d.get('status') in ('available','reserved','sold'),'Invalid status')
+                            if d['status'] in ('available','reserved') and listing['status']=='sold':tenants.capacity(c,t)
+                            c.execute('UPDATE listings SET status=? WHERE id=?',(d['status'],lid))
                     elif route=='/api/favorite':
                         exists=c.execute('DELETE FROM favorites WHERE user_id=? AND listing=?',(u['id'],lid)).rowcount
                         if not exists:c.execute('INSERT INTO favorites VALUES(?,?)',(u['id'],lid))
