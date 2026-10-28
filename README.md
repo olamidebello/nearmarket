@@ -117,3 +117,7 @@ python3 -m unittest discover -s tests -v
 node --check static/app.js
 ```
 Tests cover tenant isolation, membership/admin restrictions, API scopes, rotation, revocation, rate limits, API shutdown, gateway adapter payloads, signature tampering, incorrect amounts, repeated payment events, reservation locking, order visibility, pickup and issue permissions, and repeatable migrations. Provider calls are mocked; live provider accounts and browser layout are not verified. GitHub Actions runs these checks on push/PR.
+
+## Legal pages
+
+Public `/terms`, `/privacy`, and `/copyright` pages and the footer name Olamide Olatayo Bello Corporation. Signup links to terms and privacy. Policies describe implemented location, payment, storage, and administrator access behavior. Before production use, the operator should publish a verified legal/privacy contact and review the policies for its operating jurisdictions and actual retention practices. No jurisdiction, arbitration requirement, or statutory copyright agent is invented.

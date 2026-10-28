@@ -73,10 +73,10 @@ class Handler(BaseHTTPRequestHandler):
             self.api('GET'); return
         path=urlparse(self.path).path
         files={route:'index.html' for route in ('/','/admin','/admin/','/admin/api','/admin/keys','/admin/api-keys','/admin/payment-gateways','/admin/locations')}
-        files.update({'/app.js':'app.js','/gateway-gui.js':'gateway-gui.js','/location-gui.js':'location-gui.js','/style.css':'style.css'})
+        files.update({'/terms':'terms.html','/privacy':'privacy.html','/copyright':'copyright.html','/app.js':'app.js','/gateway-gui.js':'gateway-gui.js','/location-gui.js':'location-gui.js','/style.css':'style.css'})
         if path not in files:self.send(404,{'error':'Not found'});return
         raw=(ROOT/'static'/files[path]).read_bytes(); self.send_response(200)
-        self.send_header('Content-Type',{'index.html':'text/html; charset=utf-8','app.js':'text/javascript','gateway-gui.js':'text/javascript','location-gui.js':'text/javascript','style.css':'text/css'}[files[path]])
+        self.send_header('Content-Type',{'index.html':'text/html; charset=utf-8','terms.html':'text/html; charset=utf-8','privacy.html':'text/html; charset=utf-8','copyright.html':'text/html; charset=utf-8','app.js':'text/javascript','gateway-gui.js':'text/javascript','location-gui.js':'text/javascript','style.css':'text/css'}[files[path]])
         self.send_header('Cache-Control','no-store')
         self.send_header('X-Content-Type-Options','nosniff'); self.send_header('Referrer-Policy','same-origin')
         self.send_header('Content-Security-Policy',"default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; base-uri 'none'; frame-ancestors 'none'")
